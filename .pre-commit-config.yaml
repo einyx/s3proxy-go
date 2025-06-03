@@ -1,0 +1,85 @@
+# Pre-commit configuration for s3proxy-go
+repos:
+  # General housekeeping
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        exclude: charts/.*/templates/.*\.yaml$
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  # Secret detection - primary tool
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: .*\.lock$|go\.sum$|\.secrets\.baseline$
+
+  # Gitleaks - additional secret scanning
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.27.0
+    hooks:
+      - id: gitleaks
+
+  # TruffleHog - enhanced secret detection
+  - repo: https://github.com/trufflesecurity/trufflehog
+    rev: v3.88.35
+    hooks:
+      - id: trufflehog
+        entry: trufflehog filesystem .
+        pass_filenames: false
+
+  # Go specific hooks - using local commands for better compatibility
+  - repo: local
+    hooks:
+      - id: go-fmt
+        name: go fmt
+        entry: sh -c 'gofmt -l -w $(find . -name "*.go" -type f)'
+        language: system
+        pass_filenames: false
+      - id: go-vet
+        name: go vet
+        entry: sh -c 'go vet ./...'
+        language: system
+        pass_filenames: false
+
+  # Security scanning for Go - using local gosec if available
+  - repo: local
+    hooks:
+      - id: gosec
+        name: Go Security Checker
+        entry: sh -c 'if command -v gosec >/dev/null 2>&1; then gosec -fmt=json -out=gosec-report.json -stdout -verbose=text -severity=low ./...; else echo "gosec not installed, skipping"; fi'
+        language: system
+        pass_filenames: false
+
+  # YAML linting
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.37.1
+    hooks:
+      - id: yamllint
+        args: ["-d", "{extends: relaxed, rules: {line-length: {max: 120}}}"]
+        exclude: charts/.*/templates/.*\.yaml$
+
+  # Dockerfile linting - disabled when Docker is not running
+  # - repo: https://github.com/hadolint/hadolint
+  #   rev: v2.12.0
+  #   hooks:
+  #     - id: hadolint-docker
+
+  # Markdown linting
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.45.0
+    hooks:
+      - id: markdownlint
+        args: ["--fix"]
+
+# Configuration
+default_stages: [pre-commit]
+fail_fast: false
