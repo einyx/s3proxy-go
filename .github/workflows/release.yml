@@ -25,14 +25,18 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      - name: Generate version
+        id: version
+        run: |
+          timestamp=$(date +%Y%m%d%H%M%S)
+          short_sha=$(git rev-parse --short HEAD)
+          version="v0.0.${timestamp}-${short_sha}"
+          echo "tag=${version}" >> $GITHUB_OUTPUT
 
       - name: Create tag
         run: |
-          git tag ${{ steps.sha.outputs.short }}
-          git push origin ${{ steps.sha.outputs.short }}
+          git tag ${{ steps.version.outputs.tag }}
+          git push origin ${{ steps.version.outputs.tag }}
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v5
