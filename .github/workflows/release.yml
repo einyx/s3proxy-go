@@ -29,14 +29,10 @@ jobs:
         id: sha
         run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - name: Create release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create tag
         run: |
-          gh release create ${{ steps.sha.outputs.short }} \
-            --title "Release ${{ steps.sha.outputs.short }}" \
-            --notes "Automated release for commit ${{ github.sha }}" \
-            --generate-notes
+          git tag ${{ steps.sha.outputs.short }}
+          git push origin ${{ steps.sha.outputs.short }}
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v5
