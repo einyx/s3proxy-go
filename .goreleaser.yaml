@@ -1,0 +1,109 @@
+project_name: s3proxy
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: s3proxy
+    main: ./cmd/s3proxy
+    binary: s3proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+
+archives:
+  - id: s3proxy
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE*
+      - .env.example
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: 'Features'
+      regexp: '^feat'
+    - title: 'Bug Fixes'
+      regexp: '^fix'
+    - title: 'Performance'
+      regexp: '^perf'
+    - title: 'Security'
+      regexp: '^security'
+    - title: 'Other'
+
+release:
+  github:
+    owner: "{{ .Env.GITHUB_REPOSITORY_OWNER }}"
+    name: "{{ .ProjectName }}"
+  name_template: "{{.ProjectName}} v{{.Version}}"
+  header: |
+    ## S3Proxy {{.Version}}
+
+    High-performance S3-compatible proxy with support for multiple storage backends.
+
+  footer: |
+    ## Docker Images
+
+    ```bash
+    docker pull ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}
+    docker pull ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:latest
+    ```
+
+    ## Helm Chart
+
+    ```bash
+    helm repo add s3proxy https://{{ .Env.GITHUB_REPOSITORY_OWNER }}.github.io/{{ .ProjectName }}
+    helm install s3proxy s3proxy/s3proxy --version {{ .Version }}
+    ```
+
+# Homebrew tap (optional - requires separate tap repository)
+# brews:
+#   - name: s3proxy
+#     homepage: https://github.com/{{ .Env.GITHUB_REPOSITORY }}
+#     description: "High-performance S3-compatible proxy"
+#     license: "Apache-2.0"
+#     tap:
+#       owner: "{{ .Env.GITHUB_REPOSITORY_OWNER }}"
+#       name: homebrew-tap
+#     folder: Formula

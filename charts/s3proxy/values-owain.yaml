@@ -1,0 +1,46 @@
+# Values for owain namespace deployment
+service:
+  name: minio
+  type: ClusterIP
+  port: 9000
+
+config:
+  storage:
+    provider: "azure"
+    azure:
+      # These will be overridden by --set flags
+      accountName: ""
+      accountKey: ""
+      containerName: ""
+
+  auth:
+    type: "none"
+
+# Enable AWS credentials
+awsCredentials:
+  enabled: true
+  # These will be overridden by --set flags
+  accessKeyId: ""
+  secretAccessKey: ""
+
+# Autoscaling configuration
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+# Resources
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+# Pod disruption budget for high availability
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
