@@ -22,6 +22,12 @@ helm install s3proxy ./charts/s3proxy -f ./charts/s3proxy/values-azure.yaml
 
 # Install with S3 backend
 helm install s3proxy ./charts/s3proxy -f ./charts/s3proxy/values-s3.yaml
+
+# Install with ExternalSecrets for Azure
+helm install s3proxy ./charts/s3proxy -f ./charts/s3proxy/values-externalsecrets-azure.yaml
+
+# Install with ExternalSecrets for AWS
+helm install s3proxy ./charts/s3proxy -f ./charts/s3proxy/values-externalsecrets-aws.yaml
 ```
 
 ## Configuration
@@ -107,6 +113,126 @@ awsCredentials:
   enabled: true
   accessKeyId: "your-access-key-id"
   secretAccessKey: "your-secret-access-key"  # pragma: allowlist secret
+```
+
+### Using ExternalSecrets
+
+S3Proxy supports [ExternalSecrets Operator](https://external-secrets.io/) for managing sensitive credentials from external secret management systems like Vault, AWS Secrets Manager, Azure Key Vault, etc.
+
+#### Prerequisites
+
+1. Install ExternalSecrets Operator in your cluster
+2. Create a SecretStore or ClusterSecretStore for your backend
+
+#### Azure Storage with ExternalSecrets
+
+```yaml
+# Configure ExternalSecrets to fetch Azure credentials
+externalSecrets:
+  enabled: true
+  secretStore:
+    name: "vault-backend"  # Your SecretStore name
+    kind: "SecretStore"
+    
+  azure:
+    enabled: true
+    remoteRefs:
+      accountName:
+        key: "secret/data/azure/storage"  # Path in Vault
+        property: "account_name"          # JSON property
+      accountKey:
+        key: "secret/data/azure/storage"
+        property: "account_key"
+      # Optional: SAS token
+      sasToken:
+        key: "secret/data/azure/storage"
+        property: "sas_token"
+```
+
+#### AWS S3 with ExternalSecrets
+
+```yaml
+# Configure ExternalSecrets to fetch AWS credentials
+externalSecrets:
+  enabled: true
+  secretStore:
+    name: "aws-secrets-manager"
+    kind: "SecretStore"
+    
+  aws:
+    enabled: true
+    remoteRefs:
+      accessKeyId:
+        key: "s3-credentials"       # Secret name in AWS SM
+        property: "accessKeyId"     # JSON property
+      secretAccessKey:
+        key: "s3-credentials"
+        property: "secretAccessKey"
+```
+
+#### Authentication Credentials with ExternalSecrets
+
+```yaml
+# S3Proxy authentication from external secrets
+externalSecrets:
+  auth:
+    enabled: true
+    remoteRefs:
+      identity:
+        key: "s3proxy/auth"
+        property: "username"
+      credential:
+        key: "s3proxy/auth"
+        property: "password"
+```
+
+#### Complete Example with Vault
+
+```yaml
+# values-externalsecrets.yaml
+config:
+  storage:
+    provider: "azure"
+    azure:
+      containerName: "my-container"
+      # Credentials come from ExternalSecrets
+      
+  auth:
+    type: "awsv4"
+    # Credentials come from ExternalSecrets
+
+externalSecrets:
+  enabled: true
+  refreshInterval: 15s
+  
+  secretStore:
+    name: "vault-backend"
+    kind: "SecretStore"
+    
+  azure:
+    enabled: true
+    remoteRefs:
+      accountName:
+        key: "secret/data/azure/storage"
+        property: "account_name"
+      accountKey:
+        key: "secret/data/azure/storage"
+        property: "account_key"
+        
+  auth:
+    enabled: true
+    remoteRefs:
+      identity:
+        key: "secret/data/s3proxy/auth"
+        property: "access_key"
+      credential:
+        key: "secret/data/s3proxy/auth"
+        property: "secret_key"
+```
+
+Deploy with:
+```bash
+helm install s3proxy ./charts/s3proxy -f values-externalsecrets.yaml
 ```
 
 ### High Availability

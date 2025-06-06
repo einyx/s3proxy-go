@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -19,19 +20,24 @@ import (
 
 var (
 	// Optimized pools
+	smallBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 4*1024) // 4KB for small files
+		},
+	}
 	bufferPool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 1024*1024) // 1MB buffers
+			return make([]byte, 64*1024) // 64KB for medium files
 		},
 	}
 	largeBufferPool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 16*1024*1024) // 16MB buffers
+			return make([]byte, 1024*1024) // 1MB buffers
 		},
 	}
 	hugeBufferPool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 64*1024*1024) // 64MB buffers
+			return make([]byte, 16*1024*1024) // 16MB buffers
 		},
 	}
 	// Response pool
@@ -232,7 +238,7 @@ func (h *Handler) handleObject(w http.ResponseWriter, r *http.Request) {
 
 	// Handle uploads query
 	if r.URL.Query().Get("uploads") != "" && r.Method == "POST" {
-		logger.Debug("Initiating multipart upload")
+		logger.Info("Initiating multipart upload")
 		h.initiateMultipartUpload(w, r, bucket, key)
 		return
 	}
@@ -402,32 +408,11 @@ func (h *Handler) getObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		headers.Set("x-amz-meta-"+k, v)
 	}
 
-	// RESEARCH-BASED FIX: Avoid sync.Pool overhead for small files based on Go 1.21 regression analysis
-	if obj.Size <= 1024*1024 { // 1MB - fix the benchmark weakness
-		// ZERO-COPY: Try ReaderFrom interface for direct syscall copying
-		if rf, ok := w.(io.ReaderFrom); ok {
-			if _, err := rf.ReadFrom(obj.Body); err != nil && !isClientDisconnectError(err) {
-				logger.WithError(err).Error("Failed to copy object data")
-			}
-			return
-		}
-		
-		// Fallback: Direct buffer allocation for 1MB
-		buf := make([]byte, obj.Size)
-		n, err := io.ReadFull(obj.Body, buf)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			logrus.WithError(err).Debug("Failed to read object data")
-			return
-		}
-		if _, err := w.Write(buf[:n]); err != nil && !isClientDisconnectError(err) {
-			logger.WithError(err).Error("Failed to write object data")
-		}
-	} else {
-		// RESEARCH-BASED: Use Go's native io.Copy for larger files (splice optimization)
-		// Avoid buffer pools for larger files where splice syscalls are beneficial
-		if _, err := io.Copy(w, obj.Body); err != nil && !isClientDisconnectError(err) {
-			logger.WithError(err).Error("Failed to copy object data")
-		}
+	// PERFORMANCE OPTIMIZATION: Use direct io.Copy for all sizes
+	// Go's io.Copy automatically uses splice syscalls on Linux for optimal performance
+	// The previous chunking approach was causing the 10MB GET performance issue
+	if _, err := io.Copy(w, obj.Body); err != nil && !isClientDisconnectError(err) {
+		logger.WithError(err).Error("Failed to copy object data")
 	}
 
 	if logrus.GetLevel() >= logrus.DebugLevel {
@@ -435,81 +420,7 @@ func (h *Handler) getObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	}
 }
 
-// zeroCopyStreamObject implements ultra-fast streaming with zero allocations
-func (h *Handler) zeroCopyStreamObject(w *zeroCopyResponseWriter, obj *storage.Object, flusher http.Flusher) {
-	// ZERO-COPY: Optimize for 1MB files (our benchmark weakness)
-	if obj.Size <= 1024*1024 {
-		// Single buffer read/write for 1MB files
-		bufSlice := bufferPool.Get().([]byte)
-		buf := bufSlice[:obj.Size]
-		defer bufferPool.Put(bufSlice)
-
-		n, err := io.ReadFull(obj.Body, buf)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			return
-		}
-
-		// Single write + flush for maximum speed
-		w.Write(buf[:n])
-		flusher.Flush()
-		return
-	}
-
-	// ZERO-COPY: Use Go's splice optimization for larger files
-	if _, err := io.Copy(w, obj.Body); err == nil {
-		flusher.Flush()
-	}
-}
-
-func (h *Handler) streamObject(w io.Writer, obj *storage.Object, flusher http.Flusher) {
-	// Get optimal buffer from pool based on object size
-	var buf []byte
-	var flushInterval int64
-
-	if obj.Size > 50*1024*1024 { // > 50MB (reduced threshold)
-		buf = hugeBufferPool.Get().([]byte)
-		defer hugeBufferPool.Put(buf)
-		flushInterval = 16 * 1024 * 1024 // Flush every 16MB for huge files (doubled)
-	} else {
-		buf = largeBufferPool.Get().([]byte)
-		defer largeBufferPool.Put(buf)
-		flushInterval = 4 * 1024 * 1024 // Flush every 4MB for large files (doubled)
-	}
-
-	// Stream with periodic flushing
-	written := int64(0)
-
-	for {
-		n, err := obj.Body.Read(buf)
-		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				if !isClientDisconnectError(writeErr) {
-					logrus.WithError(writeErr).Debug("Failed to write stream data")
-				}
-				return
-			}
-
-			written += int64(n)
-
-			// Flush periodically for real-time delivery
-			if written%flushInterval < int64(n) {
-				flusher.Flush()
-			}
-		}
-
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			logrus.WithError(err).Debug("Failed to read stream data")
-			return
-		}
-	}
-
-	// Final flush
-	flusher.Flush()
-}
+// Removed zeroCopyStreamObject and streamObject - using direct io.Copy instead for better performance
 
 func (h *Handler) getRangeObject(w http.ResponseWriter, r *http.Request, bucket, key, rangeHeader string) {
 	ctx := r.Context()
@@ -676,45 +587,63 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		return
 	}
 
-	// ULTRA PUT OPTIMIZATION: Fast path for 1MB benchmark
-	if size == 1024*1024 { // Exactly 1MB - critical benchmark size
-		logger.Debug("Using 1MB fast path")
-		// ZERO METADATA: Skip metadata processing for 1MB benchmark
-		// DIRECT STREAM: Pass body directly for maximum speed
-		err := h.storage.PutObject(ctx, bucket, key, r.Body, size, nil)
+	// CRITICAL PUT OPTIMIZATION: Fast path for small files
+	var body io.Reader = r.Body
+	
+	// For small files, buffer in memory for faster processing
+	if size > 0 && size <= 100*1024 { // <= 100KB
+		buf := smallBufferPool.Get().([]byte)
+		if int64(len(buf)) < size {
+			smallBufferPool.Put(buf)
+			buf = make([]byte, size)
+		} else {
+			buf = buf[:size]
+			defer smallBufferPool.Put(buf)
+		}
+		
+		// Read entire small file into memory
+		_, err := io.ReadFull(r.Body, buf)
 		if err != nil {
-			logger.WithError(err).Error("Failed to put object (1MB fast path)")
-			h.sendError(w, err, http.StatusInternalServerError)
+			logger.WithError(err).Error("Failed to read request body")
+			h.sendError(w, err, http.StatusBadRequest)
 			return
 		}
-
-		// FAST RESPONSE: Minimal headers for 1MB
-		w.Header().Set("ETag", fmt.Sprintf("\"%x\"", time.Now().UnixNano()))
-		w.WriteHeader(http.StatusOK)
-		if logrus.GetLevel() >= logrus.DebugLevel {
-			logger.WithField("duration", time.Since(start)).Debug("PUT completed (1MB fast path)")
-		}
-		return
+		body = bytes.NewReader(buf)
 	}
 
-	// Standard path for other sizes
-	metadata := make(map[string]string)
-	for k, v := range r.Header {
+	// Extract metadata only if present
+	var metadata map[string]string
+	hasMetadata := false
+	for k := range r.Header {
 		if strings.HasPrefix(strings.ToLower(k), "x-amz-meta-") {
-			metaKey := strings.TrimPrefix(strings.ToLower(k), "x-amz-meta-")
-			metadata[metaKey] = v[0]
+			hasMetadata = true
+			break
+		}
+	}
+	
+	if hasMetadata {
+		metadata = make(map[string]string)
+		for k, v := range r.Header {
+			if strings.HasPrefix(strings.ToLower(k), "x-amz-meta-") {
+				metaKey := strings.TrimPrefix(strings.ToLower(k), "x-amz-meta-")
+				metadata[metaKey] = v[0]
+			}
 		}
 	}
 
-	err := h.storage.PutObject(ctx, bucket, key, r.Body, size, metadata)
+	// PERFORMANCE: Direct upload with minimal processing
+	err := h.storage.PutObject(ctx, bucket, key, body, size, metadata)
 	if err != nil {
 		logger.WithError(err).Error("Failed to put object")
 		h.sendError(w, err, http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("ETag", fmt.Sprintf("\"%x\"", time.Now().UnixNano()))
+	// Fast ETag generation
+	etag := fmt.Sprintf("\"%x\"", time.Now().UnixNano())
+	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
+	
 	if logrus.GetLevel() >= logrus.DebugLevel {
 		logger.WithField("duration", time.Since(start)).Debug("PUT completed")
 	}
@@ -857,15 +786,28 @@ func (h *Handler) initiateMultipartUpload(w http.ResponseWriter, r *http.Request
 		UploadId string   `xml:"UploadId"`
 	}
 
-	w.Header().Set("Content-Type", "application/xml")
-	enc := xml.NewEncoder(w)
-	enc.Indent("", "  ")
-	if err := enc.Encode(initiateMultipartUploadResult{
+	response := initiateMultipartUploadResult{
 		Bucket:   bucket,
 		Key:      key,
 		UploadId: uploadID,
-	}); err != nil {
+	}
+
+	// Build XML response
+	var buf bytes.Buffer
+	buf.WriteString(xml.Header)
+	enc := xml.NewEncoder(&buf)
+	enc.Indent("", "  ")
+	if err := enc.Encode(response); err != nil {
 		logrus.WithError(err).Error("Failed to encode response")
+		h.sendError(w, err, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		logrus.WithError(err).Error("Failed to write response")
 	}
 }
 

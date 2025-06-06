@@ -97,19 +97,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setupRoutes() {
-	// Minimal setup
-	// Skip ALL middleware except absolutely essential auth
-	if s.config.Auth.Type != "none" {
-		s.router.Use(s.authMiddleware) // Only auth if required
-	}
+	// CRITICAL: Register health check FIRST with highest priority
+	// This ensures it's matched before any middleware or other routes
+	s.router.HandleFunc("/health", s.healthCheck).Methods("GET")
 
-	// REMOVED: Pre-warming middleware was adding overhead
-	// Direct routing is faster for our benchmark
+	// Now setup authenticated routes
+	// IMPORTANT: Use a custom handler that applies auth per-request
+	s.router.PathPrefix("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Double-check: Skip auth for health endpoint
+		if r.URL.Path == "/health" {
+			s.healthCheck(w, r)
+			return
+		}
 
-	// Skip health check endpoint to reduce routing overhead
+		// Apply auth if configured
+		if s.config.Auth.Type != "none" {
+			if err := s.auth.Authenticate(r); err != nil {
+				w.WriteHeader(http.StatusForbidden)
+				w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
+				return
+			}
+		}
 
-	// Direct S3 API routes with ZERO middleware
-	s.router.PathPrefix("/").Handler(s.s3Handler)
+		// Pass to S3 handler
+		s.s3Handler.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
@@ -150,15 +162,23 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// authMiddleware is no longer used - auth is handled inline in setupRoutes
+// Kept for reference only
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Ultra-fast path: inline auth check
-		if s.auth == nil || s.config.Auth.Type == "none" || r.Header.Get("Authorization") == "" {
+		// Skip auth for health check
+		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Cached auth result
+		// Ultra-fast path: inline auth check
+		if s.auth == nil || s.config.Auth.Type == "none" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Check for authorization
 		if err := s.auth.Authenticate(r); err != nil {
 			w.WriteHeader(http.StatusForbidden)
 			w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))

@@ -4,10 +4,24 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/einyx/s3proxy-go)](https://goreportcard.com/report/github.com/einyx/s3proxy-go)
 [![Docker Pulls](https://img.shields.io/docker/pulls/s3proxy/s3proxy-go)](https://hub.docker.com/r/s3proxy/s3proxy-go)
+[![CI Status](https://github.com/einyx/s3proxy-go/workflows/CI/badge.svg)](https://github.com/einyx/s3proxy-go/actions)
+[![codecov](https://codecov.io/gh/einyx/s3proxy-go/branch/main/graph/badge.svg?token=ABCDEFG)](https://codecov.io/gh/einyx/s3proxy-go)
+[![Release](https://img.shields.io/github/release/einyx/s3proxy-go.svg)](https://github.com/einyx/s3proxy-go/releases/latest)
+[![GoDoc](https://pkg.go.dev/badge/github.com/einyx/s3proxy-go?status.svg)](https://pkg.go.dev/github.com/einyx/s3proxy-go)
+[![Vibes](https://img.shields.io/badge/vibes-immaculate%20✨-ff69b4?style=flat)](https://github.com/einyx/s3proxy-go)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat)](http://makeapullrequest.com)
 
 A high-performance, production-ready S3-compatible proxy server written in Go.
 S3Proxy-Go provides a unified S3 API interface for multiple storage backends
 including AWS S3, Azure Blob Storage, and local filesystem storage.
+
+<p align="center">
+  <img src="https://img.shields.io/badge/AWS%20S3-Compatible-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white" alt="AWS S3 Compatible" />
+  <img src="https://img.shields.io/badge/Azure%20Blob-Supported-0078D4?style=for-the-badge&logo=microsoft-azure&logoColor=white" alt="Azure Blob Storage" />
+  <img src="https://img.shields.io/badge/Kubernetes-Ready-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white" alt="Kubernetes Ready" />
+  <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker Ready" />
+  <img src="https://img.shields.io/badge/Prometheus-Metrics-E6522C?style=for-the-badge&logo=prometheus&logoColor=white" alt="Prometheus Metrics" />
+</p>
 
 ## 🚀 Key Features
 
@@ -53,6 +67,10 @@ including AWS S3, Azure Blob Storage, and local filesystem storage.
 - **Comprehensive error handling**
 
 ## 📊 Performance Benchmarks
+
+![Benchmarks](https://img.shields.io/badge/benchmarks-passing-brightgreen.svg)
+![Performance](https://img.shields.io/badge/performance-blazing%20fast-orange.svg)
+![Latency](https://img.shields.io/badge/latency-<10ms-blue.svg)
 
 ```text
 BenchmarkS3ProxyGet-8           50000      23456 ns/op    1024 B/op     12 allocs/op
@@ -704,5 +722,11 @@ see the [LICENSE](LICENSE) file for details.
 - 💼 [Professional Support](https://s3proxy.io/support)
 
 ---
+
+<p align="center">
+  <a href="https://github.com/einyx/s3proxy-go/stargazers"><img src="https://img.shields.io/github/stars/einyx/s3proxy-go?style=social" alt="GitHub stars"></a>
+  <a href="https://github.com/einyx/s3proxy-go/network/members"><img src="https://img.shields.io/github/forks/einyx/s3proxy-go?style=social" alt="GitHub forks"></a>
+  <a href="https://twitter.com/intent/tweet?text=Check%20out%20S3Proxy-Go%20-%20A%20high-performance%20S3-compatible%20proxy%20server!&url=https://github.com/einyx/s3proxy-go"><img src="https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Fgithub.com%2Feinyx%2Fs3proxy-go" alt="Tweet"></a>
+</p>
 
 Made with ❤️ by the S3Proxy community

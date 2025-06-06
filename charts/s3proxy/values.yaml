@@ -17,7 +17,7 @@ fullnameOverride: ""
 # Service configuration
 service:
   # Service name - defaults to "minio" for compatibility
-  name: minio
+  name: s3proxy-go
   type: ClusterIP
   port: 9000
   targetPort: 8080
@@ -97,6 +97,66 @@ secrets:
   # Additional secret data
   data: {}
 
+# ExternalSecrets configuration
+externalSecrets:
+  enabled: false
+  # External Secrets Operator backend type
+  # Options: vault, aws-secrets-manager, azure-key-vault, google-secret-manager, etc.
+  backendType: vault
+  
+  # Refresh interval for syncing secrets
+  refreshInterval: 15s
+  
+  # Secret store configuration
+  secretStore:
+    name: ""
+    kind: SecretStore  # or ClusterSecretStore
+    
+  # Azure storage credentials from external secret
+  azure:
+    enabled: false
+    # Remote references for Azure credentials
+    remoteRefs:
+      accountName:
+        key: "azure/storage/account-name"
+        property: ""  # optional: JSON property if secret contains JSON
+      accountKey:
+        key: "azure/storage/account-key"
+        property: ""
+      sasToken:
+        key: "azure/storage/sas-token"
+        property: ""
+    # Target secret name (will be created by ExternalSecrets)
+    targetSecretName: "s3proxy-azure-credentials"
+    
+  # AWS/S3 storage credentials from external secret  
+  aws:
+    enabled: false
+    # Remote references for AWS credentials
+    remoteRefs:
+      accessKeyId:
+        key: "aws/s3/access-key-id"
+        property: ""
+      secretAccessKey:
+        key: "aws/s3/secret-access-key"
+        property: ""
+    # Target secret name (will be created by ExternalSecrets)
+    targetSecretName: "s3proxy-aws-credentials"
+    
+  # Authentication credentials from external secret
+  auth:
+    enabled: false
+    # Remote references for auth credentials
+    remoteRefs:
+      identity:
+        key: "s3proxy/auth/identity"
+        property: ""
+      credential:
+        key: "s3proxy/auth/credential"
+        property: ""
+    # Target secret name (will be created by ExternalSecrets)
+    targetSecretName: "s3proxy-auth-credentials"
+
 serviceAccount:
   # Specifies whether a service account should be created
   create: true
@@ -154,11 +214,8 @@ affinity: {}
 # Liveness and readiness probes
 livenessProbe:
   httpGet:
-    path: /
+    path: /health
     port: http
-    httpHeaders:
-    - name: Host
-      value: healthcheck
   initialDelaySeconds: 30
   periodSeconds: 10
   timeoutSeconds: 5
@@ -166,11 +223,8 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /
+    path: /health
     port: http
-    httpHeaders:
-    - name: Host
-      value: healthcheck
   initialDelaySeconds: 5
   periodSeconds: 5
   timeoutSeconds: 3

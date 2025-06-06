@@ -101,19 +101,22 @@ func run(cmd *cobra.Command, args []string) error {
 	srv := &http.Server{
 		Addr:              cfg.Server.Listen,
 		Handler:           proxyServer,
-		ReadTimeout:       10 * time.Second,       // RESEARCH: Faster for 1MB files
+		ReadTimeout:       30 * time.Second,       // Balanced for various file sizes
 		WriteTimeout:      300 * time.Second,      // Keep for large uploads
-		IdleTimeout:       120 * time.Second,      // RESEARCH: Longer keep-alive for connection reuse
-		MaxHeaderBytes:    1 << 20,                // RESEARCH: Smaller headers for speed (1MB)
-		ReadHeaderTimeout: 500 * time.Millisecond, // RESEARCH: Ultra-fast header parsing
-
-		// ZERO-COPY: Enable HTTP/2 for better multiplexing when possible
-		TLSConfig: nil, // HTTP/1.1 for this test, but would enable HTTP/2 in production
+		IdleTimeout:       300 * time.Second,      // Much longer keep-alive for connection reuse
+		MaxHeaderBytes:    1 << 20,                // 1MB headers
+		ReadHeaderTimeout: 2 * time.Second,        // More reasonable header timeout
 
 		// RESEARCH-BASED: Custom connection state handler for optimization
 		ConnState: func(conn net.Conn, state http.ConnState) {
-			// Could add per-connection TCP optimizations here
-			// For benchmark, we rely on the dialer optimizations
+			if state == http.StateNew {
+				// Set TCP options for better performance
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					tcpConn.SetNoDelay(true)           // Disable Nagle for low latency
+					tcpConn.SetKeepAlive(true)         // Enable keep-alive
+					tcpConn.SetKeepAlivePeriod(30 * time.Second)
+				}
+			}
 		},
 	}
 

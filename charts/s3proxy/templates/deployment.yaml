@@ -69,6 +69,27 @@ spec:
 
             {{- if eq .Values.config.storage.provider "azure" }}
             # Azure configuration
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.azure.enabled }}
+            # Using ExternalSecrets for Azure credentials
+            - name: AZURE_ACCOUNT_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.azure.targetSecretName }}
+                  key: AZURE_ACCOUNT_NAME
+            - name: AZURE_ACCOUNT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.azure.targetSecretName }}
+                  key: AZURE_ACCOUNT_KEY
+            {{- if .Values.externalSecrets.azure.remoteRefs.sasToken.key }}
+            - name: AZURE_SAS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.azure.targetSecretName }}
+                  key: AZURE_SAS_TOKEN
+            {{- end }}
+            {{- else }}
+            # Using traditional secret management
             - name: AZURE_ACCOUNT_NAME
               value: {{ .Values.config.storage.azure.accountName | quote }}
             {{- if .Values.config.storage.azure.accountKey }}
@@ -78,6 +99,14 @@ spec:
                   name: {{ include "s3proxy.fullname" . }}
                   key: azure-account-key
             {{- end }}
+            {{- if .Values.config.storage.azure.sasToken }}
+            - name: AZURE_SAS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "s3proxy.fullname" . }}
+                  key: azure-sas-token
+            {{- end }}
+            {{- end }}
             - name: AZURE_CONTAINER_NAME
               value: {{ .Values.config.storage.azure.containerName | quote }}
             {{- if .Values.config.storage.azure.endpoint }}
@@ -86,13 +115,6 @@ spec:
             {{- end }}
             - name: AZURE_USE_SAS
               value: {{ .Values.config.storage.azure.useSAS | quote }}
-            {{- if .Values.config.storage.azure.sasToken }}
-            - name: AZURE_SAS_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "s3proxy.fullname" . }}
-                  key: azure-sas-token
-            {{- end }}
             {{- end }}
 
             {{- if eq .Values.config.storage.provider "s3" }}
@@ -103,6 +125,20 @@ spec:
             {{- end }}
             - name: S3_REGION
               value: {{ .Values.config.storage.s3.region | quote }}
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.aws.enabled }}
+            # Using ExternalSecrets for AWS credentials
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.aws.targetSecretName }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.aws.targetSecretName }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- else }}
+            # Using traditional secret management
             {{- if .Values.config.storage.s3.accessKey }}
             - name: S3_ACCESS_KEY
               valueFrom:
@@ -116,6 +152,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "s3proxy.fullname" . }}
                   key: s3-secret-key
+            {{- end }}
             {{- end }}
             - name: S3_USE_PATH_STYLE
               value: {{ .Values.config.storage.s3.usePathStyle | quote }}
@@ -132,6 +169,20 @@ spec:
             # Authentication configuration
             - name: AUTH_TYPE
               value: {{ .Values.config.auth.type | quote }}
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.auth.enabled }}
+            # Using ExternalSecrets for auth credentials
+            - name: AUTH_IDENTITY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.auth.targetSecretName }}
+                  key: AUTH_IDENTITY
+            - name: AUTH_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.auth.targetSecretName }}
+                  key: AUTH_CREDENTIAL
+            {{- else }}
+            # Using traditional secret management
             {{- if .Values.config.auth.identity }}
             - name: AUTH_IDENTITY
               value: {{ .Values.config.auth.identity | quote }}
@@ -142,6 +193,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "s3proxy.fullname" . }}
                   key: auth-credential
+            {{- end }}
             {{- end }}
 
             # AWS Credentials for fast auth
