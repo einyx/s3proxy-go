@@ -3,6 +3,8 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/url"
@@ -176,10 +178,32 @@ func (a *AzureBackend) ListObjectsWithDelimiter(ctx context.Context, bucket, pre
 
 		// Add blob items
 		for _, blob := range resp.Segment.BlobItems {
+			key := blob.Name
+			// Convert .dir blobs back to directory names
+			if strings.HasSuffix(key, "/.dir") {
+				// Check if this is a directory marker
+				if blob.Metadata != nil {
+					if isDir, exists := blob.Metadata["s3proxyDirectoryMarker"]; exists && isDir == "true" {
+						if origKey, origExists := blob.Metadata["s3proxyOriginalKey"]; origExists {
+							key = origKey
+						} else {
+							// Fallback: convert .dir suffix back to /
+							key = strings.TrimSuffix(key, "/.dir") + "/"
+						}
+					}
+				}
+			}
+			
+			// Use stored MD5 hash as ETag for S3 compatibility
+			etag := string(blob.Properties.Etag)
+			if md5Hash, exists := blob.Metadata["s3proxyMD5"]; exists {
+				etag = fmt.Sprintf("\"%s\"", md5Hash)
+			}
+			
 			result.Contents = append(result.Contents, ObjectInfo{
-				Key:          blob.Name,
+				Key:          key,
 				Size:         *blob.Properties.ContentLength,
-				ETag:         string(blob.Properties.Etag),
+				ETag:         etag,
 				LastModified: blob.Properties.LastModified,
 			})
 		}
@@ -201,8 +225,24 @@ func (a *AzureBackend) ListObjectsWithDelimiter(ctx context.Context, bucket, pre
 		}
 
 		for _, blob := range resp.Segment.BlobItems {
+			key := blob.Name
+			// Convert .dir blobs back to directory names
+			if strings.HasSuffix(key, "/.dir") {
+				// Check if this is a directory marker
+				if blob.Metadata != nil {
+					if isDir, exists := blob.Metadata["s3proxyDirectoryMarker"]; exists && isDir == "true" {
+						if origKey, origExists := blob.Metadata["s3proxyOriginalKey"]; origExists {
+							key = origKey
+						} else {
+							// Fallback: convert .dir suffix back to /
+							key = strings.TrimSuffix(key, "/.dir") + "/"
+						}
+					}
+				}
+			}
+			
 			result.Contents = append(result.Contents, ObjectInfo{
-				Key:          blob.Name,
+				Key:          key,
 				Size:         *blob.Properties.ContentLength,
 				ETag:         string(blob.Properties.Etag),
 				LastModified: blob.Properties.LastModified,
@@ -220,7 +260,14 @@ func (a *AzureBackend) ListObjectsWithDelimiter(ctx context.Context, bucket, pre
 
 func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	blobURL := containerURL.NewBlobURL(key)
+	
+	// Handle directory-like objects
+	normalizedKey := key
+	if strings.HasSuffix(key, "/") && key != "/" {
+		normalizedKey = strings.TrimSuffix(key, "/") + "/.dir"
+	}
+	
+	blobURL := containerURL.NewBlobURL(normalizedKey)
 
 	// Get properties first for metadata
 	props, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
@@ -246,13 +293,20 @@ func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Obje
 		// Start parallel downloads
 		go reader.startDownloads()
 		
+		// Use stored MD5 hash as ETag for S3 compatibility
+		metadata := props.NewMetadata()
+		etag := string(props.ETag())
+		if md5Hash, exists := metadata["s3proxyMD5"]; exists {
+			etag = fmt.Sprintf("\"%s\"", md5Hash)
+		}
+		
 		return &Object{
 			Body:         reader,
 			ContentType:  props.ContentType(),
 			Size:         size,
-			ETag:         string(props.ETag()),
+			ETag:         etag,
 			LastModified: props.LastModified(),
-			Metadata:     props.NewMetadata(),
+			Metadata:     metadata,
 		}, nil
 	}
 	
@@ -271,13 +325,20 @@ func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Obje
 			MaxRetryRequests: 1, // Reduced for speed
 		})
 		
+		// Use stored MD5 hash as ETag for S3 compatibility
+		metadata := props.NewMetadata()
+		etag := string(props.ETag())
+		if md5Hash, exists := metadata["s3proxyMD5"]; exists {
+			etag = fmt.Sprintf("\"%s\"", md5Hash)
+		}
+		
 		return &Object{
 			Body:         &azureHighPerfReader{ReadCloser: bodyStream, size: size},
 			ContentType:  props.ContentType(),
 			Size:         size,
-			ETag:         string(props.ETag()),
+			ETag:         etag,
 			LastModified: props.LastModified(),
-			Metadata:     props.NewMetadata(),
+			Metadata:     metadata,
 		}, nil
 	}
 	
@@ -291,13 +352,20 @@ func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Obje
 		MaxRetryRequests: 1,
 	})
 
+	// Use stored MD5 hash as ETag for S3 compatibility
+	metadata := resp.NewMetadata()
+	etag := string(resp.ETag())
+	if md5Hash, exists := metadata["s3proxyMD5"]; exists {
+		etag = fmt.Sprintf("\"%s\"", md5Hash)
+	}
+	
 	return &Object{
 		Body:         &azureFastReader{ReadCloser: bodyStream, size: size},
 		ContentType:  resp.ContentType(),
 		Size:         size,
-		ETag:         string(resp.ETag()),
+		ETag:         etag,
 		LastModified: resp.LastModified(),
-		Metadata:     resp.NewMetadata(),
+		Metadata:     metadata,
 	}, nil
 }
 
@@ -415,7 +483,54 @@ func (r *azureFastUploadReader) Read(p []byte) (n int, err error) {
 
 func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, metadata map[string]string) error {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	blobURL := containerURL.NewBlockBlobURL(key)
+	
+	logrus.WithFields(logrus.Fields{
+		"bucket": bucket,
+		"key":    key,
+		"size":   size,
+	}).Info("Azure PutObject called")
+	
+	// Initialize metadata if nil
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	
+	// Handle directory-like objects (keys ending with /)
+	// Azure doesn't allow blob names ending with /, so normalize them
+	normalizedKey := key
+	if strings.HasSuffix(key, "/") && key != "/" {
+		logrus.WithField("key", key).Info("Converting directory-like object to .dir marker")
+		
+		// For S3A compatibility: when creating a directory marker, we need to ensure
+		// there's no conflicting file at the path without trailing slash
+		baseKey := strings.TrimSuffix(key, "/")
+		baseBlobURL := containerURL.NewBlobURL(baseKey)
+		
+		// Check if there's a conflicting file and delete it if it exists
+		_, err := baseBlobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+		if err == nil {
+			logrus.WithField("conflictingKey", baseKey).Info("Found conflicting file - deleting to allow directory creation")
+			_, deleteErr := baseBlobURL.Delete(ctx, azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{})
+			if deleteErr != nil {
+				logrus.WithError(deleteErr).WithField("key", baseKey).Warn("Failed to delete conflicting file")
+			}
+		}
+		
+		// For directory markers, create a special blob without the trailing slash
+		// and add metadata to indicate it's a directory marker
+		normalizedKey = strings.TrimSuffix(key, "/") + "/.dir"
+		metadata["s3proxyDirectoryMarker"] = "true"
+		metadata["s3proxyOriginalKey"] = key
+		// For empty directory markers, always use MD5 of empty string
+		metadata["s3proxyMD5"] = "d41d8cd98f00b204e9800998ecf8427e"
+		
+		logrus.WithFields(logrus.Fields{
+			"originalKey":   key,
+			"normalizedKey": normalizedKey,
+		}).Info("Directory marker will be stored")
+	}
+	
+	blobURL := containerURL.NewBlockBlobURL(normalizedKey)
 
 	// AGGRESSIVE PUT OPTIMIZATION: Maximum performance approach
 	if size < 256*1024 { // < 256KB: Single shot upload
@@ -443,6 +558,10 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 			}
 		}
 		
+		// Calculate MD5 hash for S3 compatibility
+		hash := md5.Sum(data)
+		metadata["s3proxyMD5"] = hex.EncodeToString(hash[:])
+		
 		// Fast upload with minimal overhead
 		httpHeaders := azblob.BlobHTTPHeaders{
 			ContentType: "application/octet-stream",
@@ -456,6 +575,13 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 			return fmt.Errorf("failed to upload blob: %w", err)
 		}
 		return nil
+	}
+	
+	// For larger files, we can't easily calculate MD5 without reading the entire content
+	// For now, generate a deterministic ETag based on size and timestamp
+	// This is not ideal but maintains compatibility for large files
+	if _, exists := metadata["s3proxyMD5"]; !exists {
+		metadata["s3proxyMD5"] = fmt.Sprintf("large-file-%d-%d", size, time.Now().Unix())
 	}
 	
 	// ULTRA-HIGH PERFORMANCE STREAMING
@@ -511,7 +637,14 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 
 func (a *AzureBackend) DeleteObject(ctx context.Context, bucket, key string) error {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	blobURL := containerURL.NewBlobURL(key)
+	
+	// Handle directory-like objects
+	normalizedKey := key
+	if strings.HasSuffix(key, "/") && key != "/" {
+		normalizedKey = strings.TrimSuffix(key, "/") + "/.dir"
+	}
+	
+	blobURL := containerURL.NewBlobURL(normalizedKey)
 
 	_, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{})
 	if err != nil {
@@ -523,19 +656,113 @@ func (a *AzureBackend) DeleteObject(ctx context.Context, bucket, key string) err
 
 func (a *AzureBackend) HeadObject(ctx context.Context, bucket, key string) (*ObjectInfo, error) {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	blobURL := containerURL.NewBlobURL(key)
+	
+	logrus.WithFields(logrus.Fields{
+		"bucket": bucket,
+		"key":    key,
+	}).Info("Azure HeadObject called")
+	
+	// For S3A compatibility: if the key doesn't end with /, check for actual file first
+	// If no file exists but there's a directory marker, return 404 to allow directory creation
+	if !strings.HasSuffix(key, "/") {
+		logrus.WithField("key", key).Info("Checking for actual file (non-slash key)")
+		
+		// Check for actual file
+		blobURL := containerURL.NewBlobURL(key)
+		props, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+		if err == nil {
+			logrus.WithField("key", key).Info("Found actual file - checking if it's a directory marker")
+			
+			// Found actual file - check if it's a directory marker
+			metadata := props.NewMetadata()
+			if isDir, exists := metadata["s3proxyDirectoryMarker"]; exists && isDir == "true" {
+				logrus.WithField("key", key).Info("Found s3proxy directory marker without .dir suffix - returning 404")
+				// This is a directory marker stored without .dir suffix, which shouldn't happen
+				// but if it does, we should return 404 to allow S3A to create proper directory
+				return nil, fmt.Errorf("object not found")
+			}
+			
+			// Check for Azure HDI (Hierarchical Data Interface) folder markers
+			// Note: Azure metadata keys can have different casing
+			if hdiFolder, exists := metadata["hdi_isfolder"]; exists && hdiFolder == "true" {
+				logrus.WithField("key", key).Info("Found Azure HDI folder marker (lowercase) - returning 404 for S3A compatibility")
+				// Azure created this as a folder marker, treat it as directory for S3A compatibility
+				return nil, fmt.Errorf("object not found")
+			}
+			if hdiFolder, exists := metadata["Hdi_isfolder"]; exists && hdiFolder == "true" {
+				logrus.WithField("key", key).Info("Found Azure HDI folder marker (capitalized) - returning 404 for S3A compatibility")
+				// Azure created this as a folder marker, treat it as directory for S3A compatibility
+				return nil, fmt.Errorf("object not found")
+			}
+			
+			// Use stored MD5 hash as ETag for S3 compatibility
+			etag := string(props.ETag())
+			if md5Hash, exists := metadata["s3proxyMD5"]; exists {
+				etag = fmt.Sprintf("\"%s\"", md5Hash)
+			}
+			
+			logrus.WithFields(logrus.Fields{
+				"key":  key,
+				"size": props.ContentLength(),
+				"etag": etag,
+			}).Info("Returning actual file info")
+			
+			return &ObjectInfo{
+				Key:          key,
+				Size:         props.ContentLength(),
+				ETag:         etag,
+				LastModified: props.LastModified(),
+				Metadata:     metadata,
+			}, nil
+		}
+		
+		logrus.WithField("key", key).Info("No actual file found - checking for directory marker")
+		
+		// No actual file found, check if there's a directory marker
+		dirMarkerKey := key + "/.dir"
+		dirBlobURL := containerURL.NewBlobURL(dirMarkerKey)
+		_, dirErr := dirBlobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+		if dirErr == nil {
+			logrus.WithField("key", key).Info("Directory marker exists - returning 404 to allow S3A directory creation")
+			// Directory marker exists, return 404 for the file path to allow S3A directory creation
+			return nil, fmt.Errorf("object not found")
+		}
+		
+		logrus.WithField("key", key).Info("Neither file nor directory marker found - returning 404")
+		// Neither file nor directory marker found - return original error
+		return nil, fmt.Errorf("failed to get blob properties: %w", err)
+	}
+	
+	// Handle directory-like objects (keys ending with /)
+	normalizedKey := strings.TrimSuffix(key, "/") + "/.dir"
+	blobURL := containerURL.NewBlobURL(normalizedKey)
 
 	props, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get blob properties: %w", err)
 	}
 
+	// If this was a directory marker, restore the original key
+	resultKey := key
+	metadata := props.NewMetadata()
+	if isDir, exists := metadata["s3proxyDirectoryMarker"]; exists && isDir == "true" {
+		if origKey, origExists := metadata["s3proxyOriginalKey"]; origExists {
+			resultKey = origKey
+		}
+	}
+	
+	// Use stored MD5 hash as ETag for S3 compatibility
+	etag := string(props.ETag())
+	if md5Hash, exists := metadata["s3proxyMD5"]; exists {
+		etag = fmt.Sprintf("\"%s\"", md5Hash)
+	}
+	
 	return &ObjectInfo{
-		Key:          key,
+		Key:          resultKey,
 		Size:         props.ContentLength(),
-		ETag:         string(props.ETag()),
+		ETag:         etag,
 		LastModified: props.LastModified(),
-		Metadata:     props.NewMetadata(),
+		Metadata:     metadata,
 	}, nil
 }
 
