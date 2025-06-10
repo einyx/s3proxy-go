@@ -590,8 +590,10 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	// CRITICAL PUT OPTIMIZATION: Fast path for small files
 	var body io.Reader = r.Body
 	
-	// For small files, buffer in memory for faster processing
-	if size > 0 && size <= 100*1024 { // <= 100KB
+	// Handle zero-byte objects (directories)
+	if size == 0 {
+		body = bytes.NewReader([]byte{})
+	} else if size > 0 && size <= 100*1024 { // <= 100KB
 		buf := smallBufferPool.Get().([]byte)
 		if int64(len(buf)) < size {
 			smallBufferPool.Put(buf)
