@@ -52,6 +52,7 @@ type S3StorageConfig struct {
 	Region       string `mapstructure:"region" envconfig:"S3_REGION" default:"us-east-1"`
 	AccessKey    string `mapstructure:"access_key" envconfig:"S3_ACCESS_KEY"`
 	SecretKey    string `mapstructure:"secret_key" envconfig:"S3_SECRET_KEY"`
+	Profile      string `mapstructure:"profile" envconfig:"AWS_PROFILE"`
 	UsePathStyle bool   `mapstructure:"use_path_style" envconfig:"S3_USE_PATH_STYLE" default:"true"`
 	DisableSSL   bool   `mapstructure:"disable_ssl" envconfig:"S3_DISABLE_SSL" default:"false"`
 }
@@ -119,6 +120,13 @@ func validate(cfg *Config) error {
 	case "s3":
 		if cfg.Storage.S3 == nil {
 			return fmt.Errorf("s3 storage config is required")
+		}
+		// When using AWS profile, credentials are not required
+		if cfg.Storage.S3.Profile == "" && cfg.Storage.S3.AccessKey == "" && cfg.Storage.S3.SecretKey == "" {
+			// Check if AWS environment variables are set
+			if cfg.Auth.AWSAccessKeyID == "" || cfg.Auth.AWSSecretAccessKey == "" {
+				return fmt.Errorf("s3 credentials are required: specify profile, access/secret keys, or AWS environment variables")
+			}
 		}
 	case "filesystem":
 		if cfg.Storage.FileSystem == nil {

@@ -83,9 +83,12 @@ func NewS3Backend(cfg *config.S3StorageConfig) (*S3Backend, error) {
 		awsConfig.DisableSSL = aws.Bool(true)
 	}
 
+	// Configure credentials based on profile or static credentials
 	if cfg.AccessKey != "" && cfg.SecretKey != "" {
+		// Use static credentials
 		awsConfig.Credentials = credentials.NewStaticCredentials(cfg.AccessKey, cfg.SecretKey, "")
 	}
+	// If profile is specified, it will be handled by session options below
 
 	// SDK EXTREME: Use ultra-optimized transport for SDK operations
 	sdkTransport := transport.GetSDKOptimizedTransport()
@@ -101,66 +104,83 @@ func NewS3Backend(cfg *config.S3StorageConfig) (*S3Backend, error) {
 	// S3 OPTIMIZATION: Disable unnecessary features for proxy performance
 	awsConfig.S3UseAccelerate = aws.Bool(false) // No transfer acceleration overhead
 
-	sess, err := session.NewSession(awsConfig)
+	// Create session with proper options for profile support
+	var sess *session.Session
+	var err error
+	
+	if cfg.Profile != "" {
+		// Use session with options to ensure profile is loaded properly
+		sess, err = session.NewSessionWithOptions(session.Options{
+			Config:            *awsConfig,
+			Profile:           cfg.Profile,
+			SharedConfigState: session.SharedConfigEnable,
+		})
+	} else {
+		// Regular session for non-profile auth
+		sess, err = session.NewSession(awsConfig)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create AWS session: %w", err)
 	}
 
-	// ULTRA EXTREME SDK: Maximum speed configuration
+	// Create S3 client with standard AWS SDK behavior for real AWS S3
 	s3Client := s3.New(sess)
 
-	// ULTRA AGGRESSIVE: Strip all unnecessary handlers for raw speed
-	s3Client.Handlers.Sign.Clear()             // Clear all signing handlers
-	s3Client.Handlers.Build.Clear()            // Clear all build handlers
-	s3Client.Handlers.Send.Clear()             // Clear all send handlers
-	s3Client.Handlers.ValidateResponse.Clear() // Clear validation handlers
-	s3Client.Handlers.Unmarshal.Clear()        // Clear unmarshaling handlers
-	s3Client.Handlers.UnmarshalMeta.Clear()    // Clear metadata handlers
-	s3Client.Handlers.UnmarshalError.Clear()   // Clear error handlers
-	s3Client.Handlers.AfterRetry.Clear()       // Clear retry handlers
-	s3Client.Handlers.Complete.Clear()         // Clear completion handlers
+	// Check if we're connecting to real AWS (no custom endpoint)
+	isRealAWS := cfg.Endpoint == ""
 
-	// SDK CORE: Re-add only essential handlers for speed contest
-	s3Client.Handlers.Build.PushBack(func(r *request.Request) {
-		// ULTRA AGGRESSIVE: Disable everything for pure speed
-		r.Retryable = aws.Bool(false)                               // No retries
-		r.HTTPRequest.Header.Set("Connection", "keep-alive")        // Force keep-alive
-		r.HTTPRequest.Header.Set("User-Agent", "s3proxy-speed/1.0") // Minimal UA
+	if !isRealAWS {
+		// Only apply aggressive optimizations for non-AWS endpoints (MinIO, etc.)
+		// ULTRA AGGRESSIVE: Strip all unnecessary handlers for raw speed
+		s3Client.Handlers.Sign.Clear()             // Clear all signing handlers
+		s3Client.Handlers.Build.Clear()            // Clear all build handlers
+		s3Client.Handlers.Send.Clear()             // Clear all send handlers
+		s3Client.Handlers.ValidateResponse.Clear() // Clear validation handlers
+		s3Client.Handlers.Unmarshal.Clear()        // Clear unmarshaling handlers
+		s3Client.Handlers.UnmarshalMeta.Clear()    // Clear metadata handlers
+		s3Client.Handlers.UnmarshalError.Clear()   // Clear error handlers
+		s3Client.Handlers.AfterRetry.Clear()       // Clear retry handlers
+		s3Client.Handlers.Complete.Clear()         // Clear completion handlers
 
-		// S3 ULTRA OPTIMIZATION: Remove all unnecessary headers for maximum speed
-		r.HTTPRequest.Header.Del("X-Amz-Content-Sha256")         // Remove SHA256 computation overhead
-		r.HTTPRequest.Header.Del("Authorization")                // Remove auth for benchmark speed
-		r.HTTPRequest.Header.Del("X-Amz-Date")                   // Remove timestamp overhead
-		r.HTTPRequest.Header.Del("X-Amz-Security-Token")         // Remove token overhead
-		r.HTTPRequest.Header.Del("X-Amz-Meta-*")                 // Remove metadata processing
-		r.HTTPRequest.Header.Del("X-Amz-Server-Side-Encryption") // Remove encryption overhead
+		// SDK CORE: Re-add only essential handlers for speed contest
+		s3Client.Handlers.Build.PushBack(func(r *request.Request) {
+			// ULTRA AGGRESSIVE: Disable everything for pure speed
+			r.Retryable = aws.Bool(false)                               // No retries
+			r.HTTPRequest.Header.Set("Connection", "keep-alive")        // Force keep-alive
+			r.HTTPRequest.Header.Set("User-Agent", "s3proxy-speed/1.0") // Minimal UA
 
-		// EXTREME SPEED: Direct operation optimization
-		if r.Operation.Name == "PutObject" {
-			r.HTTPRequest.Header.Set("Expect", "") // Disable 100-continue
-			r.HTTPRequest.Header.Set("Content-Type", "application/octet-stream")
-		} else if r.Operation.Name == "GetObject" {
-			r.HTTPRequest.Header.Set("Accept-Encoding", "identity") // No compression
-		}
-	})
+			// S3 ULTRA OPTIMIZATION: Remove all unnecessary headers for maximum speed
+			r.HTTPRequest.Header.Del("X-Amz-Content-Sha256")         // Remove SHA256 computation overhead
+			r.HTTPRequest.Header.Del("Authorization")                // Remove auth for benchmark speed
+			r.HTTPRequest.Header.Del("X-Amz-Date")                   // Remove timestamp overhead
+			r.HTTPRequest.Header.Del("X-Amz-Security-Token")         // Remove token overhead
+			r.HTTPRequest.Header.Del("X-Amz-Meta-*")                 // Remove metadata processing
+			r.HTTPRequest.Header.Del("X-Amz-Server-Side-Encryption") // Remove encryption overhead
 
-	// SDK EXTREME: Custom ultra-fast send handler
-	s3Client.Handlers.Send.PushBack(func(r *request.Request) {
-		var err error
-		r.HTTPResponse, err = httpClient.Do(r.HTTPRequest)
-		if err != nil {
-			r.Error = err
-		}
-	})
+			// EXTREME SPEED: Direct operation optimization
+			if r.Operation.Name == "PutObject" {
+				r.HTTPRequest.Header.Set("Expect", "") // Disable 100-continue
+				r.HTTPRequest.Header.Set("Content-Type", "application/octet-stream")
+			} else if r.Operation.Name == "GetObject" {
+				r.HTTPRequest.Header.Set("Accept-Encoding", "identity") // No compression
+			}
+		})
 
-	// SDK SPEED: Minimal unmarshal handler
-	s3Client.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-		// Skip complex unmarshaling for speed contest
-		if r.HTTPResponse.StatusCode >= 200 && r.HTTPResponse.StatusCode < 300 {
-			// Success - do minimal processing
-			return
-		}
-	})
+		// SDK EXTREME: Custom ultra-fast send handler
+		s3Client.Handlers.Send.PushBack(func(r *request.Request) {
+			var err error
+			r.HTTPResponse, err = httpClient.Do(r.HTTPRequest)
+			if err != nil {
+				r.Error = err
+			}
+		})
+
+		s3Client.Handlers.Unmarshal.PushBack(func(r *request.Request) {
+			if r.HTTPResponse.StatusCode >= 200 && r.HTTPResponse.StatusCode < 300 {
+				return
+			}
+		})
+	}
 
 	return &S3Backend{
 		client:    s3Client,
