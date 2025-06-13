@@ -65,7 +65,7 @@ nfpms:
     dependencies:
       - systemd
     contents:
-      - src: s3proxy
+      - src: "{{ .Binary }}"
         dst: /usr/bin/s3proxy
       - src: config-test.yaml
         dst: /etc/s3proxy/config.yaml.example

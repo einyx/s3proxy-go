@@ -7,9 +7,17 @@ paths = [
     '''node_modules/''',
     '''dist/''',
     '''.git/''',
-    '''*.min.js''',
-    '''*.min.css''',
+    '''.*\.min\.js''',
+    '''.*\.min\.css''',
+    '''.secrets.baseline''',
 ]
+regexes = [
+    '''example\.com''',
+    '''test[_-]?key''',
+    '''dummy[_-]?secret''',
+    '''fake[_-]?token''',
+]
+commits = []
 
 [[rules]]
 id = "aws-access-key"
@@ -34,14 +42,3 @@ id = "private-key"
 description = "Private Key"
 regex = '''-----BEGIN (RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----'''
 tags = ["key", "Private"]
-
-[allowlist.regexes]
-regexes = [
-    '''example\.com''',
-    '''test[_-]?key''',
-    '''dummy[_-]?secret''',
-    '''fake[_-]?token''',
-]
-
-[allowlist.commits]
-commits = []
