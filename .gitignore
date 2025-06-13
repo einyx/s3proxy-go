@@ -121,6 +121,12 @@ debug-fs/
 
 # Security scanning
 gosec-report.json
+gosec-results.sarif
+trivy-results.json
+trivy-results.sarif
+semgrep-results.sarif
+.secrets.baseline
+sbom.spdx.json
 trufflehog-results.json
 
 # AWS credentials and config

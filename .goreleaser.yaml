@@ -76,16 +76,11 @@ nfpms:
       postinstall: ./scripts/postinstall.sh
       preremove: ./scripts/preremove.sh
 
-nsis:
-  - id: s3proxy-installer
-    name: S3Proxy-{{ .Version }}-Windows-{{ .Arch }}-installer
-    homepage: https://github.com/{{ .Env.GITHUB_REPOSITORY }}
-    license: LICENSE
-    script: installer.nsi
-    include:
-      - LICENSE
-      - README.md
-      - config-test.yaml
+# Windows release is handled via archives section above
+# For installer support, consider using:
+# - MSI with WiX (requires .wxs file)
+# - Chocolatey package
+# - Scoop manifest
 
 changelog:
   sort: asc
@@ -122,7 +117,12 @@ release:
     ## Installation
 
     ### Windows
-    Download and run the Windows installer: `S3Proxy-{{ .Version }}-Windows-x86_64-installer.exe`
+    Download and extract the Windows ZIP: `s3proxy_Windows_x86_64.zip`
+    ```powershell
+    # Extract and add to PATH
+    Expand-Archive s3proxy_Windows_x86_64.zip -DestinationPath C:\s3proxy
+    $env:Path += ";C:\s3proxy"
+    ```
 
     ### Linux (Debian/Ubuntu)
     ```bash
