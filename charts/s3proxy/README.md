@@ -133,7 +133,7 @@ externalSecrets:
   secretStore:
     name: "vault-backend"  # Your SecretStore name
     kind: "SecretStore"
-    
+
   azure:
     enabled: true
     remoteRefs:
@@ -158,7 +158,7 @@ externalSecrets:
   secretStore:
     name: "aws-secrets-manager"
     kind: "SecretStore"
-    
+
   aws:
     enabled: true
     remoteRefs:
@@ -196,7 +196,7 @@ config:
     azure:
       containerName: "my-container"
       # Credentials come from ExternalSecrets
-      
+
   auth:
     type: "awsv4"
     # Credentials come from ExternalSecrets
@@ -204,11 +204,11 @@ config:
 externalSecrets:
   enabled: true
   refreshInterval: 15s
-  
+
   secretStore:
     name: "vault-backend"
     kind: "SecretStore"
-    
+
   azure:
     enabled: true
     remoteRefs:
@@ -218,7 +218,7 @@ externalSecrets:
       accountKey:
         key: "secret/data/azure/storage"
         property: "account_key"
-        
+
   auth:
     enabled: true
     remoteRefs:
@@ -231,6 +231,7 @@ externalSecrets:
 ```
 
 Deploy with:
+
 ```bash
 helm install s3proxy ./charts/s3proxy -f values-externalsecrets.yaml
 ```

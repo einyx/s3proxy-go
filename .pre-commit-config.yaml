@@ -1,85 +1,80 @@
-# Pre-commit configuration for s3proxy-go
+# Pre-commit hooks for s3proxy-go
+# Install with: pre-commit install
+
 repos:
-  # General housekeeping
+  # Go formatting and linting
+  - repo: https://github.com/dnephin/pre-commit-golang
+    rev: v0.5.1
+    hooks:
+      - id: go-fmt
+      # - id: go-vet  # Disabled - golangci-lint includes govet
+      - id: go-imports
+      - id: go-cyclo
+        args: [-over=25]
+      - id: golangci-lint
+      - id: go-mod-tidy
+      - id: go-unit-tests
+        name: go-unit-tests
+        entry: go test
+        files: '\.go$'
+        args: ["./..."]
+        pass_filenames: false
+        types: [go]
+        language: system
+
+  # General file checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
-        exclude: charts/.*/templates/.*\.yaml$
+        exclude: ^(charts/.*\.yaml|examples/kubernetes/.*\.yaml)$
       - id: check-added-large-files
-        args: ["--maxkb=1000"]
-      - id: check-case-conflict
+        args: ['--maxkb=1000']
       - id: check-merge-conflict
+      - id: check-json
+      - id: pretty-format-json
+        args: ['--autofix', '--indent=2']
       - id: detect-private-key
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
 
-  # Secret detection - primary tool
+  # Security scanning
   - repo: https://github.com/Yelp/detect-secrets
     rev: v1.5.0
     hooks:
       - id: detect-secrets
-        args: ["--baseline", ".secrets.baseline"]
-        exclude: .*\.lock$|go\.sum$|\.secrets\.baseline$
+        args: ['--baseline', '.secrets.baseline']
 
-  # Gitleaks - additional secret scanning
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.27.0
+    rev: v8.18.2
     hooks:
       - id: gitleaks
 
-  # TruffleHog - enhanced secret detection
-  - repo: https://github.com/trufflesecurity/trufflehog
-    rev: v3.88.35
-    hooks:
-      - id: trufflehog
-        entry: trufflehog filesystem .
-        pass_filenames: false
-
-  # Go specific hooks - using local commands for better compatibility
-  - repo: local
-    hooks:
-      - id: go-fmt
-        name: go fmt
-        entry: sh -c 'gofmt -l -w $(find . -name "*.go" -type f)'
-        language: system
-        pass_filenames: false
-      - id: go-vet
-        name: go vet
-        entry: sh -c 'go vet ./...'
-        language: system
-        pass_filenames: false
-
-  # Security scanning for Go - using local gosec if available
-  - repo: local
-    hooks:
-      - id: gosec
-        name: Go Security Checker
-        entry: sh -c 'if command -v gosec >/dev/null 2>&1; then gosec -fmt=json -out=gosec-report.json -stdout -verbose=text -severity=low ./...; else echo "gosec not installed, skipping"; fi'
-        language: system
-        pass_filenames: false
-
-  # YAML linting
-  - repo: https://github.com/adrienverge/yamllint
-    rev: v1.37.1
-    hooks:
-      - id: yamllint
-        args: ["-d", "{extends: relaxed, rules: {line-length: {max: 120}}}"]
-        exclude: charts/.*/templates/.*\.yaml$
-
-  # Dockerfile linting - disabled when Docker is not running
-  # - repo: https://github.com/hadolint/hadolint
-  #   rev: v2.12.0
-  #   hooks:
-  #     - id: hadolint-docker
-
-  # Markdown linting
+  # Markdown
   - repo: https://github.com/igorshubovych/markdownlint-cli
     rev: v0.45.0
     hooks:
       - id: markdownlint
-        args: ["--fix"]
+        args: ['--fix']
 
-# Configuration
-default_stages: [pre-commit]
-fail_fast: false
+  # YAML
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.37.1
+    hooks:
+      - id: yamllint
+        args: [-c=.yamllint.yaml]
+        exclude: ^charts/.*/templates/.*\.yaml$
+
+  # Shell scripts
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+
+  # Git commit messages
+  - repo: https://github.com/jorisroovers/gitlint
+    rev: v0.19.1
+    hooks:
+      - id: gitlint

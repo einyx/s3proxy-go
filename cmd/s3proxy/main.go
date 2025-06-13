@@ -8,14 +8,14 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"runtime/debug"
 	"syscall"
 	"time"
 
-	"github.com/einyx/s3proxy-go/internal/config"
-	"github.com/einyx/s3proxy-go/internal/proxy"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/einyx/s3proxy-go/internal/config"
+	"github.com/einyx/s3proxy-go/internal/proxy"
 )
 
 var (
@@ -42,18 +42,14 @@ func main() {
 	}
 }
 
-func run(cmd *cobra.Command, args []string) error {
-	// RESEARCH-BASED: Balanced runtime optimizations to avoid regression
-	runtime.GOMAXPROCS(runtime.NumCPU()) // Use all CPUs normally
-	debug.SetGCPercent(200)              // Moderate GC tuning (avoid excessive overhead)
-	debug.SetMemoryLimit(8 << 30)        // 8GB memory limit
+func run(cmd *cobra.Command, _ []string) error {
+	// Rely on Go runtime defaults for GC and CPU scheduling.
 
 	logLevel, _ := cmd.Flags().GetString("log-level")
 	level, err := logrus.ParseLevel(logLevel)
 	if err != nil {
 		return fmt.Errorf("invalid log level: %w", err)
 	}
-	// EXTREME: Force warn level for maximum performance
 	if level < logrus.WarnLevel {
 		level = logrus.WarnLevel
 	}
@@ -61,14 +57,11 @@ func run(cmd *cobra.Command, args []string) error {
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 
 	logrus.WithFields(logrus.Fields{
-		"version":    version,
-		"commit":     commit,
-		"date":       date,
-		"gomaxprocs": runtime.GOMAXPROCS(0),
-		"gc_percent": debug.SetGCPercent(-1), // Query current value
-		"num_cpu":    runtime.NumCPU(),
+		"version": version,
+		"commit":  commit,
+		"date":    date,
+		"num_cpu": runtime.NumCPU(),
 	}).Info("Starting S3 proxy server")
-	debug.SetGCPercent(200) // Set it back
 
 	configFile, _ := cmd.Flags().GetString("config")
 	cfg, err := config.Load(configFile)
@@ -97,24 +90,24 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create proxy server: %w", err)
 	}
 
-	// ZERO-COPY EXTREME: Research-based HTTP server optimizations
+	// Custom HTTP server settings
 	srv := &http.Server{
 		Addr:              cfg.Server.Listen,
 		Handler:           proxyServer,
-		ReadTimeout:       30 * time.Second,       // Balanced for various file sizes
-		WriteTimeout:      300 * time.Second,      // Keep for large uploads
-		IdleTimeout:       300 * time.Second,      // Much longer keep-alive for connection reuse
-		MaxHeaderBytes:    1 << 20,                // 1MB headers
-		ReadHeaderTimeout: 2 * time.Second,        // More reasonable header timeout
+		ReadTimeout:       30 * time.Second,  // Balanced for various file sizes
+		WriteTimeout:      300 * time.Second, // Keep for large uploads
+		IdleTimeout:       300 * time.Second, // Much longer keep-alive for connection reuse
+		MaxHeaderBytes:    1 << 20,           // 1MB headers
+		ReadHeaderTimeout: 2 * time.Second,   // More reasonable header timeout
 
-		// RESEARCH-BASED: Custom connection state handler for optimization
+		// Custom connection state handler
 		ConnState: func(conn net.Conn, state http.ConnState) {
 			if state == http.StateNew {
 				// Set TCP options for better performance
 				if tcpConn, ok := conn.(*net.TCPConn); ok {
-					tcpConn.SetNoDelay(true)           // Disable Nagle for low latency
-					tcpConn.SetKeepAlive(true)         // Enable keep-alive
-					tcpConn.SetKeepAlivePeriod(30 * time.Second)
+					_ = tcpConn.SetNoDelay(true)   // Disable Nagle for low latency
+					_ = tcpConn.SetKeepAlive(true) // Enable keep-alive
+					_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 				}
 			}
 		},

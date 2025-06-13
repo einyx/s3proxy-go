@@ -1,3 +1,4 @@
+// Package transport provides optimized HTTP transport configurations.
 package transport
 
 import (
@@ -124,11 +125,12 @@ func NewFastHTTPTransport() *http.Transport {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   500 * time.Millisecond,
 		ExpectContinueTimeout: 200 * time.Millisecond,
-		DisableCompression:    true,                   // No compression
+		DisableCompression:    true, // No compression
 		DisableKeepAlives:     false,
 		ResponseHeaderTimeout: 1 * time.Second,
 		// Optimize TLS
 		TLSClientConfig: &tls.Config{
+			MinVersion:             tls.VersionTLS12,
 			SessionTicketsDisabled: false, // Enable session resumption
 			ClientSessionCache:     tls.NewLRUClientSessionCache(1000),
 		},
@@ -184,6 +186,7 @@ func GetSDKOptimizedTransport() *http.Transport {
 		DisableKeepAlives:     false,
 		ResponseHeaderTimeout: 1 * time.Second, // SDK EXTREME: 1s headers
 		TLSClientConfig: &tls.Config{
+			MinVersion:             tls.VersionTLS12,
 			SessionTicketsDisabled: false,
 			ClientSessionCache:     tls.NewLRUClientSessionCache(2000), // Larger cache
 		},

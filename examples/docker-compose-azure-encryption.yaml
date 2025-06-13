@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  s3proxy:
+    image: s3proxy-go:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # Server configuration
+      SERVER_LISTEN: ":8080"
+      LOG_LEVEL: "info"
+      LOG_FORMAT: "json"
+
+      # Storage configuration
+      STORAGE_PROVIDER: "azure"
+
+      # Azure configuration
+      AZURE_ACCOUNT_NAME: "${AZURE_STORAGE_ACCOUNT}"
+      AZURE_ACCOUNT_KEY: "${AZURE_STORAGE_KEY}"
+      AZURE_CONTAINER_NAME: "${AZURE_CONTAINER_NAME:-s3proxy-encrypted}"
+
+      # Encryption configuration
+      ENCRYPTION_ENABLED: "true"
+      ENCRYPTION_ALGORITHM: "aes-gcm"
+      ENCRYPTION_KEY_PROVIDER: "local"
+      ENCRYPTION_LOCAL_MASTER_KEY: "${ENCRYPTION_MASTER_KEY}"
+
+      # Authentication configuration
+      AUTH_TYPE: "awsv4"
+      AUTH_IDENTITY: "${S3PROXY_ACCESS_KEY:-admin}"
+      AUTH_CREDENTIAL: "${S3PROXY_SECRET_KEY:-secretpassword}"
+
+      # Performance configuration
+      CACHE_ENABLED: "true"
+      CACHE_SIZE_MB: "100"
+      CACHE_TTL: "300"
+
+      # Metrics
+      METRICS_ENABLED: "true"
+      METRICS_PATH: "/metrics"
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    depends_on:
+      - s3proxy
+
+  # Optional: Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+# Example prometheus.yml configuration:
+# global:
+#   scrape_interval: 15s
+#
+# scrape_configs:
+#   - job_name: 's3proxy'
+#     static_configs:
+#       - targets: ['s3proxy:8080']
+#     metrics_path: '/metrics'

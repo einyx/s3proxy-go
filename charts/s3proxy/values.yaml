@@ -75,6 +75,30 @@ config:
     identity: ""
     credential: ""
 
+  # Encryption settings
+  encryption:
+    enabled: false
+    algorithm: "AES-256-GCM"
+    keyProvider: "local"  # local or kms
+
+    # Local key configuration
+    local:
+      masterKey: ""
+
+    # KMS key configuration
+    kms:
+      keyId: ""
+      region: "us-east-1"
+      cacheTTL: 300
+
+    # Encryption policies
+    policies: []
+    # Example policy:
+    # - bucketPattern: "secure-*"
+    #   algorithm: "AES-256-GCM"
+    #   keyProvider: "kms"
+    #   mandatory: true
+
 # AWS Credentials from environment (for fast auth)
 awsCredentials:
   enabled: false
@@ -103,15 +127,15 @@ externalSecrets:
   # External Secrets Operator backend type
   # Options: vault, aws-secrets-manager, azure-key-vault, google-secret-manager, etc.
   backendType: vault
-  
+
   # Refresh interval for syncing secrets
   refreshInterval: 15s
-  
+
   # Secret store configuration
   secretStore:
     name: ""
     kind: SecretStore  # or ClusterSecretStore
-    
+
   # Azure storage credentials from external secret
   azure:
     enabled: false
@@ -128,8 +152,8 @@ externalSecrets:
         property: ""
     # Target secret name (will be created by ExternalSecrets)
     targetSecretName: "s3proxy-azure-credentials"
-    
-  # AWS/S3 storage credentials from external secret  
+
+  # AWS/S3 storage credentials from external secret
   aws:
     enabled: false
     # Remote references for AWS credentials
@@ -142,7 +166,7 @@ externalSecrets:
         property: ""
     # Target secret name (will be created by ExternalSecrets)
     targetSecretName: "s3proxy-aws-credentials"
-    
+
   # Authentication credentials from external secret
   auth:
     enabled: false
@@ -156,6 +180,17 @@ externalSecrets:
         property: ""
     # Target secret name (will be created by ExternalSecrets)
     targetSecretName: "s3proxy-auth-credentials"
+
+  # Encryption keys from external secret
+  encryption:
+    enabled: false
+    # Remote references for encryption keys
+    remoteRefs:
+      masterKey:
+        key: "s3proxy/encryption/master-key"
+        property: ""
+    # Target secret name (will be created by ExternalSecrets)
+    targetSecretName: "s3proxy-encryption-keys"
 
 serviceAccount:
   # Specifies whether a service account should be created
@@ -175,7 +210,7 @@ podSecurityContext:
 securityContext:
   capabilities:
     drop:
-    - ALL
+      - ALL
   readOnlyRootFilesystem: true
   runAsNonRoot: true
   runAsUser: 1000
@@ -235,8 +270,8 @@ ingress:
   enabled: false
   className: ""
   annotations: {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
+  # kubernetes.io/ingress.class: nginx
+  # kubernetes.io/tls-acme: "true"
   hosts:
     - host: s3proxy.local
       paths:
@@ -258,17 +293,17 @@ networkPolicy:
   enabled: false
   ingress:
     - from:
-      - podSelector: {}
+        - podSelector: {}
   egress:
     - to:
-      - podSelector: {}
+        - podSelector: {}
     - to:
-      - namespaceSelector: {}
+        - namespaceSelector: {}
       ports:
-      - protocol: TCP
-        port: 443
-      - protocol: TCP
-        port: 80
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
 
 # Monitoring
 monitoring:

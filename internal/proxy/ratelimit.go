@@ -1,3 +1,4 @@
+// Package proxy provides HTTP proxy server implementation with rate limiting.
 package proxy
 
 import (
@@ -23,7 +24,7 @@ type ipLimiter struct {
 }
 
 // NewRateLimiter creates a new rate limiter
-func NewRateLimiter(globalRPS, perIPRPS float64, burst int) *RateLimiter {
+func NewRateLimiter(globalRPS, _ float64, burst int) *RateLimiter {
 	rl := &RateLimiter{
 		global:   rate.NewLimiter(rate.Limit(globalRPS), burst),
 		perIP:    make(map[string]*ipLimiter),
@@ -85,7 +86,7 @@ func (rl *RateLimiter) getLimiter(ip string, perIPRPS float64) *rate.Limiter {
 	return limiter
 }
 
-// RateLimitMiddleware returns a middleware that enforces rate limits
+// Middleware returns a middleware that enforces rate limits
 func (rl *RateLimiter) Middleware(perIPRPS float64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

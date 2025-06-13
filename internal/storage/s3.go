@@ -5,27 +5,30 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/sirupsen/logrus"
+
 	"github.com/einyx/s3proxy-go/internal/config"
-	"github.com/einyx/s3proxy-go/internal/transport"
 )
 
 type S3Backend struct {
-	client          *s3.S3
+	defaultClient   *s3.S3                          // Default S3 client
+	clients         map[string]*s3.S3               // Per-region S3 clients
+	sessions        map[string]*session.Session     // Per-region sessions
+	config          *config.S3StorageConfig         // Keep reference to config
+	bucketMapping   map[string]string               // Simple virtual to real bucket mapping
+	bucketConfigs   map[string]*config.BucketConfig // Per-bucket configuration
 	bufferPool      sync.Pool
 	largeBufferPool sync.Pool
-	transport       *http.Transport
 	metadataCache   *MetadataCache
-	http2Client     *http.Client
+	mu              sync.RWMutex // Protect client creation
 }
 
 // MetadataCache provides fast object metadata caching
@@ -66,154 +69,336 @@ func (m *MetadataCache) Delete(key string) {
 	delete(m.cache, key)
 }
 
+// mapBucket maps a virtual bucket name to a real bucket name if mapping is configured
+func (s *S3Backend) mapBucket(virtualBucket string) string {
+	// First check bucket configs (new style)
+	if s.bucketConfigs != nil {
+		if cfg, ok := s.bucketConfigs[virtualBucket]; ok && cfg.RealName != "" {
+			logrus.WithFields(logrus.Fields{
+				"virtual": virtualBucket,
+				"real":    cfg.RealName,
+			}).Debug("Mapping bucket name from bucket config")
+			return cfg.RealName
+		}
+	}
+
+	// Fall back to simple mapping (old style)
+	if s.bucketMapping != nil {
+		if realBucket, ok := s.bucketMapping[virtualBucket]; ok {
+			logrus.WithFields(logrus.Fields{
+				"virtual": virtualBucket,
+				"real":    realBucket,
+			}).Debug("Mapping bucket name from simple mapping")
+			return realBucket
+		}
+	}
+
+	return virtualBucket
+}
+
+// getPrefixForBucket returns the prefix (subdirectory) for a virtual bucket
+func (s *S3Backend) getPrefixForBucket(virtualBucket string) string {
+	logrus.WithFields(logrus.Fields{
+		"virtualBucket": virtualBucket,
+		"hasConfigs":    s.bucketConfigs != nil,
+		"configCount":   len(s.bucketConfigs),
+	}).Debug("getPrefixForBucket called")
+
+	if s.bucketConfigs != nil {
+		if cfg, ok := s.bucketConfigs[virtualBucket]; ok {
+			logrus.WithFields(logrus.Fields{
+				"virtualBucket": virtualBucket,
+				"config":        cfg,
+				"hasPrefix":     cfg.Prefix != "",
+			}).Info("Found bucket config")
+
+			if cfg.Prefix != "" {
+				// Ensure prefix ends with / if it doesn't already
+				prefix := cfg.Prefix
+				if !strings.HasSuffix(prefix, "/") {
+					prefix += "/"
+				}
+				logrus.WithFields(logrus.Fields{
+					"virtualBucket": virtualBucket,
+					"prefix":        prefix,
+				}).Info("Using bucket prefix")
+				return prefix
+			}
+		}
+	}
+
+	logrus.WithField("virtualBucket", virtualBucket).Debug("No prefix found for bucket")
+	return ""
+}
+
+// addPrefixToKey adds the bucket prefix to a key if configured
+func (s *S3Backend) addPrefixToKey(virtualBucket, key string) string {
+	prefix := s.getPrefixForBucket(virtualBucket)
+	if prefix == "" {
+		return key
+	}
+	// Avoid double slashes
+	if strings.HasPrefix(key, "/") {
+		return prefix + key[1:]
+	}
+	return prefix + key
+}
+
+// removePrefixFromKey removes the bucket prefix from a key if configured
+func (s *S3Backend) removePrefixFromKey(virtualBucket, key string) string {
+	prefix := s.getPrefixForBucket(virtualBucket)
+	if prefix == "" {
+		return key
+	}
+	return strings.TrimPrefix(key, prefix)
+}
+
+// getClientForBucket returns the appropriate S3 client for the given bucket
+func (s *S3Backend) getClientForBucket(bucket string) (*s3.S3, error) {
+	// Check if we have a specific configuration for this bucket (virtual bucket)
+	if s.bucketConfigs != nil {
+		if cfg, ok := s.bucketConfigs[bucket]; ok {
+			logrus.WithFields(logrus.Fields{
+				"virtualBucket": bucket,
+				"realBucket":    cfg.RealName,
+				"region":        cfg.Region,
+			}).Debug("Using bucket-specific configuration")
+			return s.getOrCreateClient(cfg)
+		}
+
+		// Check if this is a real bucket that's used by virtual buckets
+		for virtualBucket, cfg := range s.bucketConfigs {
+			if cfg.RealName == bucket {
+				logrus.WithFields(logrus.Fields{
+					"realBucket":    bucket,
+					"virtualBucket": virtualBucket,
+					"region":        cfg.Region,
+				}).Debug("Using configuration from virtual bucket mapping")
+				return s.getOrCreateClient(cfg)
+			}
+		}
+	}
+
+	logrus.WithField("bucket", bucket).Debug("Using default client for bucket")
+	// Use default client
+	return s.defaultClient, nil
+}
+
+// getOrCreateClient gets or creates an S3 client for the given bucket configuration
+func (s *S3Backend) getOrCreateClient(bucketCfg *config.BucketConfig) (*s3.S3, error) {
+	// Use region as the key for client caching
+	clientKey := bucketCfg.Region // pragma: allowlist secret
+	if bucketCfg.Endpoint != "" {
+		clientKey = bucketCfg.Endpoint + "_" + bucketCfg.Region // pragma: allowlist secret
+	}
+
+	// Check if client already exists
+	s.mu.RLock()
+	if client, ok := s.clients[clientKey]; ok {
+		s.mu.RUnlock()
+		return client, nil
+	}
+	s.mu.RUnlock()
+
+	// Create new client
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if client, ok := s.clients[clientKey]; ok {
+		return client, nil
+	}
+
+	// Create AWS config for this bucket
+	awsConfig := &aws.Config{
+		Region:           aws.String(bucketCfg.Region),
+		S3ForcePathStyle: aws.Bool(s.config.UsePathStyle),
+		MaxRetries:       aws.Int(3),
+	}
+
+	// Handle endpoint
+	if bucketCfg.Endpoint != "" {
+		awsConfig.Endpoint = aws.String(bucketCfg.Endpoint)
+	} else if s.config.Endpoint != "" && bucketCfg.Endpoint == "" {
+		// Use default endpoint if bucket doesn't specify one
+		awsConfig.Endpoint = aws.String(s.config.Endpoint)
+	}
+
+	if s.config.DisableSSL {
+		awsConfig.DisableSSL = aws.Bool(true)
+	}
+
+	// Handle credentials - bucket-specific take precedence
+	if bucketCfg.AccessKey != "" && bucketCfg.SecretKey != "" {
+		awsConfig.Credentials = credentials.NewStaticCredentials(bucketCfg.AccessKey, bucketCfg.SecretKey, "")
+	} else if s.config.AccessKey != "" && s.config.SecretKey != "" {
+		awsConfig.Credentials = credentials.NewStaticCredentials(s.config.AccessKey, s.config.SecretKey, "")
+	}
+
+	// Create session
+	sess, err := session.NewSession(awsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AWS session for region %s: %w", bucketCfg.Region, err)
+	}
+
+	// Create client
+	client := s3.New(sess)
+
+	// Cache the client and session
+	s.clients[clientKey] = client // pragma: allowlist secret
+	s.sessions[clientKey] = sess  // pragma: allowlist secret
+
+	logrus.WithFields(logrus.Fields{
+		"region":   bucketCfg.Region,
+		"endpoint": bucketCfg.Endpoint,
+		"key":      clientKey,
+	}).Info("Created new S3 client for bucket")
+
+	return client, nil
+}
+
 func NewS3Backend(cfg *config.S3StorageConfig) (*S3Backend, error) {
+	// Basic AWS config
 	awsConfig := &aws.Config{
 		Region:           aws.String(cfg.Region),
 		S3ForcePathStyle: aws.Bool(cfg.UsePathStyle),
 		MaxRetries:       aws.Int(3),
-		// Optimize for throughput
-		S3Disable100Continue: aws.Bool(true),
+		// Enable S3 cross-region bucket access
+		S3UseAccelerate: aws.Bool(false),
+		// Use the global endpoint for cross-region compatibility
+		S3DisableContentMD5Validation: aws.Bool(false),
 	}
 
+	// Handle endpoint only for non-AWS services (MinIO, LocalStack, etc.)
 	if cfg.Endpoint != "" {
 		awsConfig.Endpoint = aws.String(cfg.Endpoint)
+		logrus.WithField("endpoint", cfg.Endpoint).Info("Using custom S3 endpoint")
 	}
 
 	if cfg.DisableSSL {
 		awsConfig.DisableSSL = aws.Bool(true)
 	}
 
-	// Configure credentials based on profile or static credentials
+	// Handle credentials
 	if cfg.AccessKey != "" && cfg.SecretKey != "" {
-		// Use static credentials
 		awsConfig.Credentials = credentials.NewStaticCredentials(cfg.AccessKey, cfg.SecretKey, "")
+		logrus.Info("Using static AWS credentials")
+	} else {
+		logrus.Info("Using AWS default credential chain (env vars, IAM role, etc.)")
 	}
-	// If profile is specified, it will be handled by session options below
 
-	// SDK EXTREME: Use ultra-optimized transport for SDK operations
-	sdkTransport := transport.GetSDKOptimizedTransport()
-	httpClient := &http.Client{
-		Transport: sdkTransport,
-		Timeout:   0, // No timeout for streaming operations
-	}
-	awsConfig.HTTPClient = httpClient
-
-	// S3 PERFORMANCE: AWS SDK aggressive optimizations for proxy workload
-	awsConfig.MaxRetries = aws.Int(0)             // No retries for speed
-	awsConfig.LogLevel = aws.LogLevel(aws.LogOff) // Disable logging
-	// S3 OPTIMIZATION: Disable unnecessary features for proxy performance
-	awsConfig.S3UseAccelerate = aws.Bool(false) // No transfer acceleration overhead
-
-	// Create session with proper options for profile support
+	// Create session
 	var sess *session.Session
 	var err error
-	
+
 	if cfg.Profile != "" {
-		// Use session with options to ensure profile is loaded properly
 		sess, err = session.NewSessionWithOptions(session.Options{
 			Config:            *awsConfig,
 			Profile:           cfg.Profile,
 			SharedConfigState: session.SharedConfigEnable,
 		})
+		logrus.WithField("profile", cfg.Profile).Info("Using AWS profile")
 	} else {
-		// Regular session for non-profile auth
 		sess, err = session.NewSession(awsConfig)
 	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to create AWS session: %w", err)
 	}
 
-	// Create S3 client with standard AWS SDK behavior for real AWS S3
+	// Create S3 client - let AWS SDK handle everything
 	s3Client := s3.New(sess)
 
-	// Check if we're connecting to real AWS (no custom endpoint)
-	isRealAWS := cfg.Endpoint == ""
-
-	if !isRealAWS {
-		// Only apply aggressive optimizations for non-AWS endpoints (MinIO, etc.)
-		// ULTRA AGGRESSIVE: Strip all unnecessary handlers for raw speed
-		s3Client.Handlers.Sign.Clear()             // Clear all signing handlers
-		s3Client.Handlers.Build.Clear()            // Clear all build handlers
-		s3Client.Handlers.Send.Clear()             // Clear all send handlers
-		s3Client.Handlers.ValidateResponse.Clear() // Clear validation handlers
-		s3Client.Handlers.Unmarshal.Clear()        // Clear unmarshaling handlers
-		s3Client.Handlers.UnmarshalMeta.Clear()    // Clear metadata handlers
-		s3Client.Handlers.UnmarshalError.Clear()   // Clear error handlers
-		s3Client.Handlers.AfterRetry.Clear()       // Clear retry handlers
-		s3Client.Handlers.Complete.Clear()         // Clear completion handlers
-
-		// SDK CORE: Re-add only essential handlers for speed contest
-		s3Client.Handlers.Build.PushBack(func(r *request.Request) {
-			// ULTRA AGGRESSIVE: Disable everything for pure speed
-			r.Retryable = aws.Bool(false)                               // No retries
-			r.HTTPRequest.Header.Set("Connection", "keep-alive")        // Force keep-alive
-			r.HTTPRequest.Header.Set("User-Agent", "s3proxy-speed/1.0") // Minimal UA
-
-			// S3 ULTRA OPTIMIZATION: Remove all unnecessary headers for maximum speed
-			r.HTTPRequest.Header.Del("X-Amz-Content-Sha256")         // Remove SHA256 computation overhead
-			r.HTTPRequest.Header.Del("Authorization")                // Remove auth for benchmark speed
-			r.HTTPRequest.Header.Del("X-Amz-Date")                   // Remove timestamp overhead
-			r.HTTPRequest.Header.Del("X-Amz-Security-Token")         // Remove token overhead
-			r.HTTPRequest.Header.Del("X-Amz-Meta-*")                 // Remove metadata processing
-			r.HTTPRequest.Header.Del("X-Amz-Server-Side-Encryption") // Remove encryption overhead
-
-			// EXTREME SPEED: Direct operation optimization
-			if r.Operation.Name == "PutObject" {
-				r.HTTPRequest.Header.Set("Expect", "") // Disable 100-continue
-				r.HTTPRequest.Header.Set("Content-Type", "application/octet-stream")
-			} else if r.Operation.Name == "GetObject" {
-				r.HTTPRequest.Header.Set("Accept-Encoding", "identity") // No compression
-			}
-		})
-
-		// SDK EXTREME: Custom ultra-fast send handler
-		s3Client.Handlers.Send.PushBack(func(r *request.Request) {
-			var err error
-			r.HTTPResponse, err = httpClient.Do(r.HTTPRequest)
-			if err != nil {
-				r.Error = err
-			}
-		})
-
-		s3Client.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-			if r.HTTPResponse.StatusCode >= 200 && r.HTTPResponse.StatusCode < 300 {
-				return
-			}
-		})
+	// Log the actual credentials provider being used (for debugging)
+	if sess.Config.Credentials != nil {
+		creds, err := sess.Config.Credentials.Get()
+		if err != nil {
+			logrus.WithError(err).Warn("Failed to get AWS credentials for logging")
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"provider":     creds.ProviderName,
+				"hasAccessKey": creds.AccessKeyID != "",
+			}).Info("AWS credentials resolved")
+		}
 	}
 
+	// Log bucket mapping if configured
+	if len(cfg.BucketMapping) > 0 {
+		logrus.WithField("bucketMapping", cfg.BucketMapping).Info("Bucket mapping configured")
+	}
+
+	// Log bucket configs if configured
+	if len(cfg.BucketConfigs) > 0 {
+		logrus.WithField("bucketConfigs", cfg.BucketConfigs).Info("Bucket configs configured")
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"endpoint":     cfg.Endpoint,
+		"region":       cfg.Region,
+		"usePathStyle": cfg.UsePathStyle,
+	}).Info("S3 backend created")
+
 	return &S3Backend{
-		client:    s3Client,
-		transport: sdkTransport,
-		// EXTREME: Pre-sized pools for exact benchmark sizes
+		defaultClient: s3Client,
+		clients:       make(map[string]*s3.S3),
+		sessions:      make(map[string]*session.Session),
+		config:        cfg,
+		bucketMapping: cfg.BucketMapping,
+		bucketConfigs: cfg.BucketConfigs,
 		bufferPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 1024*1024) // 1MB for exact 1MB test
+				buf := make([]byte, 32*1024) // 32KB buffers
+				return &buf
 			},
 		},
 		largeBufferPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 10*1024*1024) // 10MB for exact 10MB test
+				buf := make([]byte, 1024*1024) // 1MB buffers
+				return &buf
 			},
 		},
 		metadataCache: &MetadataCache{
 			cache: make(map[string]*cachedMetadata),
-			ttl:   10 * time.Second, // Reduced TTL for less overhead
+			ttl:   30 * time.Second,
 		},
 	}, nil
 }
 
 func (s *S3Backend) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
-	result, err := s.client.ListBucketsWithContext(ctx, &s3.ListBucketsInput{})
+	// ListBuckets is a global operation, use default client
+	result, err := s.defaultClient.ListBucketsWithContext(ctx, &s3.ListBucketsInput{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list buckets: %w", err)
 	}
 
-	buckets := make([]BucketInfo, 0, len(result.Buckets))
+	// Create a map to track real buckets
+	realBuckets := make(map[string]BucketInfo)
 	for _, b := range result.Buckets {
-		buckets = append(buckets, BucketInfo{
+		realBuckets[aws.StringValue(b.Name)] = BucketInfo{
 			Name:         aws.StringValue(b.Name),
 			CreationDate: aws.TimeValue(b.CreationDate),
+		}
+	}
+
+	// Start with all real buckets
+	buckets := make([]BucketInfo, 0, len(result.Buckets)+len(s.bucketConfigs))
+
+	// Add all real buckets first
+	for _, info := range realBuckets {
+		buckets = append(buckets, info)
+	}
+
+	// Add virtual buckets
+	for virtualName, config := range s.bucketConfigs {
+		// Use the creation date of the real bucket if available
+		creationDate := time.Now()
+		if realBucket, exists := realBuckets[config.RealName]; exists {
+			creationDate = realBucket.CreationDate
+		}
+
+		buckets = append(buckets, BucketInfo{
+			Name:         virtualName,
+			CreationDate: creationDate,
 		})
 	}
 
@@ -221,8 +406,14 @@ func (s *S3Backend) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 }
 
 func (s *S3Backend) CreateBucket(ctx context.Context, bucket string) error {
-	_, err := s.client.CreateBucketWithContext(ctx, &s3.CreateBucketInput{
-		Bucket: aws.String(bucket),
+	realBucket := s.mapBucket(bucket)
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	_, err = client.CreateBucketWithContext(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(realBucket),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create bucket: %w", err)
@@ -231,8 +422,14 @@ func (s *S3Backend) CreateBucket(ctx context.Context, bucket string) error {
 }
 
 func (s *S3Backend) DeleteBucket(ctx context.Context, bucket string) error {
-	_, err := s.client.DeleteBucketWithContext(ctx, &s3.DeleteBucketInput{
-		Bucket: aws.String(bucket),
+	realBucket := s.mapBucket(bucket)
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	_, err = client.DeleteBucketWithContext(ctx, &s3.DeleteBucketInput{
+		Bucket: aws.String(realBucket),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete bucket: %w", err)
@@ -241,8 +438,14 @@ func (s *S3Backend) DeleteBucket(ctx context.Context, bucket string) error {
 }
 
 func (s *S3Backend) BucketExists(ctx context.Context, bucket string) (bool, error) {
-	_, err := s.client.HeadBucketWithContext(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(bucket),
+	realBucket := s.mapBucket(bucket)
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return false, fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	_, err = client.HeadBucketWithContext(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(realBucket),
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "NotFound") {
@@ -254,28 +457,52 @@ func (s *S3Backend) BucketExists(ctx context.Context, bucket string) (bool, erro
 }
 
 func (s *S3Backend) ListObjects(ctx context.Context, bucket, prefix, marker string, maxKeys int) (*ListObjectsResult, error) {
-	// Call without delimiter for backward compatibility (flat listing)
 	return s.ListObjectsWithDelimiter(ctx, bucket, prefix, marker, "", maxKeys)
 }
 
 func (s *S3Backend) ListObjectsWithDelimiter(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (*ListObjectsResult, error) {
+	realBucket := s.mapBucket(bucket)
+	bucketPrefix := s.getPrefixForBucket(bucket)
+
+	// Combine bucket prefix with the requested prefix
+	actualPrefix := bucketPrefix + prefix
+
+	logrus.WithFields(logrus.Fields{
+		"bucket":       bucket,
+		"realBucket":   realBucket,
+		"bucketPrefix": bucketPrefix,
+		"prefix":       prefix,
+		"actualPrefix": actualPrefix,
+		"delimiter":    delimiter,
+	}).Info("S3 ListObjectsWithDelimiter called")
+
 	input := &s3.ListObjectsInput{
-		Bucket:  aws.String(bucket),
+		Bucket:  aws.String(realBucket),
 		MaxKeys: aws.Int64(int64(maxKeys)),
 	}
 
-	if prefix != "" {
-		input.Prefix = aws.String(prefix)
+	if actualPrefix != "" {
+		input.Prefix = aws.String(actualPrefix)
 	}
 	if marker != "" {
-		input.Marker = aws.String(marker)
+		// Add prefix to marker too
+		input.Marker = aws.String(s.addPrefixToKey(bucket, marker))
 	}
 	if delimiter != "" {
 		input.Delimiter = aws.String(delimiter)
 	}
 
-	resp, err := s.client.ListObjectsWithContext(ctx, input)
+	client, err := s.getClientForBucket(bucket)
 	if err != nil {
+		return nil, fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	resp, err := client.ListObjectsWithContext(ctx, input)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"bucket": bucket,
+			"error":  err.Error(),
+		}).Error("S3 ListObjects failed")
 		return nil, fmt.Errorf("failed to list objects: %w", err)
 	}
 
@@ -288,43 +515,16 @@ func (s *S3Backend) ListObjectsWithDelimiter(ctx context.Context, bucket, prefix
 		key := aws.StringValue(obj.Key)
 		size := aws.Int64Value(obj.Size)
 
-		// When using delimiter, filter out directory markers and zero-byte directory objects
-		if delimiter == "/" {
-			// Skip objects that end with "/" (directory markers)
-			if strings.HasSuffix(key, "/") {
-				continue
-			}
+		// Remove bucket prefix from key
+		virtualKey := s.removePrefixFromKey(bucket, key)
 
-			// Skip zero-byte objects that don't contain "/" (potential directory markers)
-			// These should be represented as CommonPrefixes instead
-			if size == 0 && !strings.Contains(key, "/") {
-				// Check if this might be a directory by seeing if there are CommonPrefixes
-				// that start with this name
-				isDirectoryMarker := false
-				for _, cp := range resp.CommonPrefixes {
-					cpPrefix := aws.StringValue(cp.Prefix)
-					if strings.HasPrefix(cpPrefix, key+"/") {
-						isDirectoryMarker = true
-						break
-					}
-				}
-
-				// Also check if this exact name appears as a CommonPrefix
-				for _, cp := range resp.CommonPrefixes {
-					if aws.StringValue(cp.Prefix) == key+"/" {
-						isDirectoryMarker = true
-						break
-					}
-				}
-
-				if isDirectoryMarker {
-					continue
-				}
-			}
+		// When using delimiter, filter out directory markers
+		if delimiter == "/" && strings.HasSuffix(virtualKey, "/") {
+			continue
 		}
 
 		result.Contents = append(result.Contents, ObjectInfo{
-			Key:          key,
+			Key:          virtualKey,
 			Size:         size,
 			ETag:         aws.StringValue(obj.ETag),
 			LastModified: aws.TimeValue(obj.LastModified),
@@ -333,33 +533,34 @@ func (s *S3Backend) ListObjectsWithDelimiter(ctx context.Context, bucket, prefix
 	}
 
 	if resp.NextMarker != nil {
-		result.NextMarker = aws.StringValue(resp.NextMarker)
+		// Remove bucket prefix from next marker
+		result.NextMarker = s.removePrefixFromKey(bucket, aws.StringValue(resp.NextMarker))
 	}
 
 	for _, prefix := range resp.CommonPrefixes {
-		result.CommonPrefixes = append(result.CommonPrefixes, aws.StringValue(prefix.Prefix))
+		// Remove bucket prefix from common prefixes
+		virtualPrefix := s.removePrefixFromKey(bucket, aws.StringValue(prefix.Prefix))
+		result.CommonPrefixes = append(result.CommonPrefixes, virtualPrefix)
 	}
 
 	return result, nil
 }
 
 func (s *S3Backend) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
-	// CHECK CACHE: Fast path for recently accessed objects
-	cacheKey := fmt.Sprintf("%s/%s", bucket, key)
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
 
-	// S3 OPTIMIZATION: Minimal GetObject request for maximum performance
 	input := &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+		Bucket: aws.String(realBucket),
+		Key:    aws.String(realKey),
 	}
 
-	// EXTREME OPTIMIZATION: Check cache for size hints
-	// This helps with 1MB and 10MB benchmarks
-	if info, found := s.metadataCache.Get(cacheKey); found {
-		_ = info.Size // Size hint for future optimizations
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get client for bucket: %w", err)
 	}
 
-	resp, err := s.client.GetObjectWithContext(ctx, input)
+	resp, err := client.GetObjectWithContext(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object: %w", err)
 	}
@@ -371,94 +572,44 @@ func (s *S3Backend) GetObject(ctx context.Context, bucket, key string) (*Object,
 		}
 	}
 
-	// OPTIMIZATION: Wrap body with optimized reader for benchmark sizes
-	var optimizedBody io.ReadCloser = resp.Body
-	size := aws.Int64Value(resp.ContentLength)
-
-	if size == 1024*1024 || size == 10*1024*1024 {
-		// FAST PATH: Pre-read small benchmark files into memory
-		buf := make([]byte, size)
-		n, err := io.ReadFull(resp.Body, buf)
-		resp.Body.Close()
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to pre-read object: %w", err)
-		}
-		optimizedBody = &fastReader{data: buf[:n]}
-	}
-
 	return &Object{
-		Body:         optimizedBody,
+		Body:         resp.Body,
 		ContentType:  aws.StringValue(resp.ContentType),
-		Size:         size,
+		Size:         aws.Int64Value(resp.ContentLength),
 		ETag:         aws.StringValue(resp.ETag),
 		LastModified: aws.TimeValue(resp.LastModified),
 		Metadata:     metadata,
 	}, nil
 }
 
-// fastReader provides zero-copy reads from pre-loaded data
-type fastReader struct {
-	data   []byte
-	offset int
-}
-
-func (r *fastReader) Read(p []byte) (int, error) {
-	if r.offset >= len(r.data) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.data[r.offset:])
-	r.offset += n
-	return n, nil
-}
-
-func (r *fastReader) Close() error {
-	r.data = nil
-	return nil
-}
-
 func (s *S3Backend) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, metadata map[string]string) error {
-	// ULTRA PUT OPTIMIZATION: Direct streaming with pre-read for small files
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
 	var body io.ReadSeeker
 	if rs, ok := reader.(io.ReadSeeker); ok {
 		body = rs
 	} else {
-		// EXTREME OPTIMIZATION: Different paths for different sizes
-		switch {
-		case size == 1024*1024: // Exactly 1MB - our critical benchmark
-			// ULTRA FAST PATH: Direct memory operation
-			return s.put1MBUltraFast(ctx, bucket, key, reader, metadata)
-		case size == 10*1024*1024: // Exactly 10MB - our other benchmark
-			// FAST PATH: Optimized for 10MB
-			return s.put10MBOptimized(ctx, bucket, key, reader, metadata)
-		case size > 0 && size <= 100*1024*1024: // Up to 100MB
-			// S3 PERFORMANCE: Single PUT for files under 100MB
-			buf := make([]byte, size)
-			_, err := io.ReadFull(reader, buf)
+		// Buffer for small objects
+		if size > 0 && size <= 5*1024*1024 { // 5MB
+			data, err := io.ReadAll(reader)
 			if err != nil {
 				return fmt.Errorf("failed to read data: %w", err)
 			}
-			body = bytes.NewReader(buf)
-		default:
-			// S3 OPTIMIZATION: Use multipart only for files >100MB
-			return s.putObjectMultipart(ctx, bucket, key, reader, size, metadata)
+			body = bytes.NewReader(data)
+		} else {
+			// For large objects, use multipart upload
+			return s.putObjectMultipart(ctx, bucket, realBucket, key, reader, metadata)
 		}
 	}
 
-	// S3 OPTIMIZATION: Minimal object allocation with S3-specific headers
 	input := &s3.PutObjectInput{
-		Bucket:        aws.String(bucket),
-		Key:           aws.String(key),
+		Bucket:        aws.String(realBucket),
+		Key:           aws.String(realKey),
 		Body:          body,
 		ContentLength: aws.Int64(size),
-		// S3 PERFORMANCE: Set content type to avoid S3 detection overhead
-		ContentType: aws.String("application/octet-stream"),
-		// S3 OPTIMIZATION: Disable server-side encryption for benchmark speed
-		ServerSideEncryption: nil,
-		// S3 PERFORMANCE: Use standard storage class for fastest access
-		StorageClass: aws.String("STANDARD"),
 	}
 
-	// S3 OPTIMIZATION: Only process metadata if it exists (avoid allocation)
 	if len(metadata) > 0 {
 		input.Metadata = make(map[string]*string, len(metadata))
 		for k, v := range metadata {
@@ -466,151 +617,63 @@ func (s *S3Backend) PutObject(ctx context.Context, bucket, key string, reader io
 		}
 	}
 
-	_, err := s.client.PutObjectWithContext(ctx, input)
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	_, err = client.PutObjectWithContext(ctx, input)
 	if err != nil {
 		return fmt.Errorf("failed to put object: %w", err)
 	}
 
-	// Invalidate cache on successful write
-	cacheKey := fmt.Sprintf("%s/%s", bucket, key)
-	s.metadataCache.Delete(cacheKey)
-
-	return nil
-}
-
-// putObjectMultipart handles large uploads with streaming multipart upload
-func (s *S3Backend) putObjectMultipart(ctx context.Context, bucket, key string, reader io.Reader, size int64, metadata map[string]string) error {
-	// Initiate multipart upload
-	input := &s3.CreateMultipartUploadInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	}
-
-	if len(metadata) > 0 {
-		input.Metadata = make(map[string]*string)
-		for k, v := range metadata {
-			input.Metadata[k] = aws.String(v)
-		}
-	}
-
-	resp, err := s.client.CreateMultipartUploadWithContext(ctx, input)
-	if err != nil {
-		return fmt.Errorf("failed to initiate multipart upload: %w", err)
-	}
-
-	uploadID := resp.UploadId
-
-	// S3 OPTIMIZATION: AWS-recommended part sizing based on research
-	var partSize int
-	if size <= 200*1024*1024 { // Up to 200MB - use 16MB parts
-		partSize = 16 * 1024 * 1024 // 16MB - AWS CRT optimization
-	} else if size <= 1024*1024*1024 { // Up to 1GB - use 64MB parts
-		partSize = 64 * 1024 * 1024 // 64MB for better throughput
-	} else {
-		partSize = 100 * 1024 * 1024 // 100MB for very large files
-	}
-
-	var parts []*s3.CompletedPart
-	partNumber := int64(1)
-
-	// S3 STREAM: Upload in optimized chunks
-	buf := make([]byte, partSize)
-	for {
-		n, readErr := io.ReadFull(reader, buf)
-		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
-			// Abort upload on error
-			s.client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(bucket),
-				Key:      aws.String(key),
-				UploadId: uploadID,
-			})
-			return fmt.Errorf("failed to read part: %w", readErr)
-		}
-
-		if n == 0 {
-			break // No more data
-		}
-
-		// Upload this part with optimized settings
-		partInput := &s3.UploadPartInput{
-			Bucket:     aws.String(bucket),
-			Key:        aws.String(key),
-			UploadId:   uploadID,
-			PartNumber: aws.Int64(partNumber),
-			Body:       bytes.NewReader(buf[:n]),
-		}
-
-		partResp, err := s.client.UploadPartWithContext(ctx, partInput)
-		if err != nil {
-			// Abort upload on error
-			s.client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(bucket),
-				Key:      aws.String(key),
-				UploadId: uploadID,
-			})
-			return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
-		}
-
-		parts = append(parts, &s3.CompletedPart{
-			ETag:       partResp.ETag,
-			PartNumber: aws.Int64(partNumber),
-		})
-
-		partNumber++
-
-		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
-			break // End of input
-		}
-	}
-
-	// Complete multipart upload
-	completeInput := &s3.CompleteMultipartUploadInput{
-		Bucket:   aws.String(bucket),
-		Key:      aws.String(key),
-		UploadId: uploadID,
-		MultipartUpload: &s3.CompletedMultipartUpload{
-			Parts: parts,
-		},
-	}
-
-	_, err = s.client.CompleteMultipartUploadWithContext(ctx, completeInput)
-	if err != nil {
-		return fmt.Errorf("failed to complete multipart upload: %w", err)
-	}
-
-	// Invalidate cache on successful write
-	cacheKey := fmt.Sprintf("%s/%s", bucket, key)
-	s.metadataCache.Delete(cacheKey)
+	// Invalidate cache
+	s.metadataCache.Delete(fmt.Sprintf("%s/%s", bucket, key))
 
 	return nil
 }
 
 func (s *S3Backend) DeleteObject(ctx context.Context, bucket, key string) error {
-	_, err := s.client.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	_, err = client.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(realBucket),
+		Key:    aws.String(realKey),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete object: %w", err)
 	}
 
-	// Invalidate cache on successful delete
-	cacheKey := fmt.Sprintf("%s/%s", bucket, key)
-	s.metadataCache.Delete(cacheKey)
+	// Invalidate cache
+	s.metadataCache.Delete(fmt.Sprintf("%s/%s", bucket, key))
 
 	return nil
 }
 
 func (s *S3Backend) HeadObject(ctx context.Context, bucket, key string) (*ObjectInfo, error) {
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
 	// Check cache first
 	cacheKey := fmt.Sprintf("%s/%s", bucket, key)
 	if cached, found := s.metadataCache.Get(cacheKey); found {
 		return cached, nil
 	}
 
-	resp, err := s.client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	resp, err := client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(realBucket),
+		Key:    aws.String(realKey),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to head object: %w", err)
@@ -639,9 +702,17 @@ func (s *S3Backend) HeadObject(ctx context.Context, bucket, key string) (*Object
 }
 
 func (s *S3Backend) GetObjectACL(ctx context.Context, bucket, key string) (*ACL, error) {
-	resp, err := s.client.GetObjectAclWithContext(ctx, &s3.GetObjectAclInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	resp, err := client.GetObjectAclWithContext(ctx, &s3.GetObjectAclInput{
+		Bucket: aws.String(realBucket),
+		Key:    aws.String(realKey),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object ACL: %w", err)
@@ -682,9 +753,12 @@ func (s *S3Backend) PutObjectACL(ctx context.Context, bucket, key string, acl *A
 }
 
 func (s *S3Backend) InitiateMultipartUpload(ctx context.Context, bucket, key string, metadata map[string]string) (string, error) {
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
 	input := &s3.CreateMultipartUploadInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+		Bucket: aws.String(realBucket),
+		Key:    aws.String(realKey),
 	}
 
 	if len(metadata) > 0 {
@@ -694,7 +768,12 @@ func (s *S3Backend) InitiateMultipartUpload(ctx context.Context, bucket, key str
 		}
 	}
 
-	resp, err := s.client.CreateMultipartUploadWithContext(ctx, input)
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return "", fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	resp, err := client.CreateMultipartUploadWithContext(ctx, input)
 	if err != nil {
 		return "", fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
@@ -703,15 +782,23 @@ func (s *S3Backend) InitiateMultipartUpload(ctx context.Context, bucket, key str
 }
 
 func (s *S3Backend) UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int, reader io.Reader, size int64) (string, error) {
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
 	// Read all data to calculate ETag
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return "", fmt.Errorf("failed to read part data: %w", err)
 	}
 
-	resp, err := s.client.UploadPartWithContext(ctx, &s3.UploadPartInput{
-		Bucket:        aws.String(bucket),
-		Key:           aws.String(key),
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return "", fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	resp, err := client.UploadPartWithContext(ctx, &s3.UploadPartInput{
+		Bucket:        aws.String(realBucket),
+		Key:           aws.String(realKey),
 		UploadId:      aws.String(uploadID),
 		PartNumber:    aws.Int64(int64(partNumber)),
 		Body:          bytes.NewReader(data),
@@ -725,6 +812,9 @@ func (s *S3Backend) UploadPart(ctx context.Context, bucket, key, uploadID string
 }
 
 func (s *S3Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []CompletedPart) error {
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
 	completedParts := make([]*s3.CompletedPart, len(parts))
 	for i, p := range parts {
 		completedParts[i] = &s3.CompletedPart{
@@ -733,9 +823,14 @@ func (s *S3Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, up
 		}
 	}
 
-	_, err := s.client.CompleteMultipartUploadWithContext(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   aws.String(bucket),
-		Key:      aws.String(key),
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	_, err = client.CompleteMultipartUploadWithContext(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(realBucket),
+		Key:      aws.String(realKey),
 		UploadId: aws.String(uploadID),
 		MultipartUpload: &s3.CompletedMultipartUpload{
 			Parts: completedParts,
@@ -749,9 +844,17 @@ func (s *S3Backend) CompleteMultipartUpload(ctx context.Context, bucket, key, up
 }
 
 func (s *S3Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
-	_, err := s.client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
-		Bucket:   aws.String(bucket),
-		Key:      aws.String(key),
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	_, err = client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(realBucket),
+		Key:      aws.String(realKey),
 		UploadId: aws.String(uploadID),
 	})
 	if err != nil {
@@ -761,9 +864,13 @@ func (s *S3Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploa
 }
 
 func (s *S3Backend) ListParts(ctx context.Context, bucket, key, uploadID string, maxParts int, partNumberMarker int) (*ListPartsResult, error) {
+	virtualBucket := bucket // Keep track of the virtual bucket name
+	realBucket := s.mapBucket(bucket)
+	realKey := s.addPrefixToKey(bucket, key)
+
 	input := &s3.ListPartsInput{
-		Bucket:   aws.String(bucket),
-		Key:      aws.String(key),
+		Bucket:   aws.String(realBucket),
+		Key:      aws.String(realKey),
 		UploadId: aws.String(uploadID),
 		MaxParts: aws.Int64(int64(maxParts)),
 	}
@@ -772,13 +879,18 @@ func (s *S3Backend) ListParts(ctx context.Context, bucket, key, uploadID string,
 		input.PartNumberMarker = aws.Int64(int64(partNumberMarker))
 	}
 
-	resp, err := s.client.ListPartsWithContext(ctx, input)
+	client, err := s.getClientForBucket(bucket)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get client for bucket: %w", err)
+	}
+
+	resp, err := client.ListPartsWithContext(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list parts: %w", err)
 	}
 
 	result := &ListPartsResult{
-		Bucket:      bucket,
+		Bucket:      virtualBucket, // Return the virtual bucket name to the client
 		Key:         key,
 		UploadID:    uploadID,
 		IsTruncated: aws.BoolValue(resp.IsTruncated),
@@ -801,101 +913,109 @@ func (s *S3Backend) ListParts(ctx context.Context, bucket, key, uploadID string,
 	return result, nil
 }
 
-// put1MBUltraFast is the most optimized path for exactly 1MB files
-func (s *S3Backend) put1MBUltraFast(ctx context.Context, bucket, key string, reader io.Reader, metadata map[string]string) error {
-	// EXTREME: Get buffer from pool without defer overhead
-	buf := s.bufferPool.Get().([]byte)
-
-	// Read data
-	n, err := io.ReadFull(reader, buf[:1024*1024])
+// putObjectMultipart handles large uploads with streaming multipart upload
+func (s *S3Backend) putObjectMultipart(ctx context.Context, virtualBucket, realBucket, key string, reader io.Reader, metadata map[string]string) error {
+	// Get the client for the virtual bucket
+	client, err := s.getClientForBucket(virtualBucket)
 	if err != nil {
-		s.bufferPool.Put(buf) // Return on error
-		return fmt.Errorf("failed to read 1MB data: %w", err)
+		return fmt.Errorf("failed to get client for bucket: %w", err)
 	}
 
-	// HTTP/2 EXTREME: Use raw HTTP/2 client for maximum speed
-	err = s.putObjectHTTP2Raw(ctx, bucket, key, buf[:n], metadata)
+	// Add prefix to key
+	realKey := s.addPrefixToKey(virtualBucket, key)
 
-	// Return buffer to pool
-	s.bufferPool.Put(buf)
-
-	return err
-}
-
-// putObjectHTTP2Raw implements ultra-fast HTTP/2 PUT with raw requests
-func (s *S3Backend) putObjectHTTP2Raw(ctx context.Context, bucket, key string, data []byte, metadata map[string]string) error {
-	// FALLBACK: For now, use standard SDK path until HTTP/2 is fully tested
-	// This ensures the proxy doesn't crash while we optimize
-	input := &s3.PutObjectInput{
-		Bucket:        aws.String(bucket),
-		Key:           aws.String(key),
-		Body:          bytes.NewReader(data),
-		ContentLength: aws.Int64(int64(len(data))),
-		ContentType:   aws.String("application/octet-stream"),
-		StorageClass:  aws.String("STANDARD"),
+	// Initiate multipart upload
+	input := &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(realBucket),
+		Key:    aws.String(realKey),
 	}
 
 	if len(metadata) > 0 {
-		input.Metadata = make(map[string]*string, len(metadata))
+		input.Metadata = make(map[string]*string)
 		for k, v := range metadata {
 			input.Metadata[k] = aws.String(v)
 		}
 	}
 
-	_, err := s.client.PutObjectWithContext(ctx, input)
+	resp, err := client.CreateMultipartUploadWithContext(ctx, input)
 	if err != nil {
-		return fmt.Errorf("failed to put object: %w", err)
+		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
-	s.metadataCache.Delete(fmt.Sprintf("%s/%s", bucket, key))
-	return nil
-}
+	uploadID := resp.UploadId
 
-// put10MBOptimized is optimized for exactly 10MB files
-func (s *S3Backend) put10MBOptimized(ctx context.Context, bucket, key string, reader io.Reader, metadata map[string]string) error {
-	// OPTIMIZATION: Use large buffer pool for 10MB
-	buf := s.largeBufferPool.Get().([]byte)
+	// Use 5MB parts
+	partSize := int64(5 * 1024 * 1024)
 
-	// Read data
-	n, err := io.ReadFull(reader, buf[:10*1024*1024])
-	if err != nil {
-		s.largeBufferPool.Put(buf) // Return on error
-		return fmt.Errorf("failed to read 10MB data: %w", err)
-	}
+	var parts []*s3.CompletedPart
+	partNumber := int64(1)
 
-	// FAST PATH: Direct S3 PUT with optimized settings
-	input := &s3.PutObjectInput{
-		Bucket:        aws.String(bucket),
-		Key:           aws.String(key),
-		Body:          bytes.NewReader(buf[:n]),
-		ContentLength: aws.Int64(int64(n)),
-		ContentType:   aws.String("application/octet-stream"),
-		StorageClass:  aws.String("STANDARD"),
-	}
+	buf := make([]byte, partSize)
+	for {
+		n, readErr := io.ReadFull(reader, buf)
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			// Abort upload on error
+			_, _ = client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(realBucket),
+				Key:      aws.String(realKey),
+				UploadId: uploadID,
+			})
+			return fmt.Errorf("failed to read part: %w", readErr)
+		}
 
-	if len(metadata) > 0 {
-		input.Metadata = make(map[string]*string, len(metadata))
-		for k, v := range metadata {
-			input.Metadata[k] = aws.String(v)
+		if n == 0 {
+			break
+		}
+
+		// Upload this part
+		partInput := &s3.UploadPartInput{
+			Bucket:     aws.String(realBucket),
+			Key:        aws.String(realKey),
+			UploadId:   uploadID,
+			PartNumber: aws.Int64(partNumber),
+			Body:       bytes.NewReader(buf[:n]),
+		}
+
+		partResp, uploadErr := client.UploadPartWithContext(ctx, partInput)
+		if uploadErr != nil {
+			// Abort upload on error
+			_, _ = client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(realBucket),
+				Key:      aws.String(realKey),
+				UploadId: uploadID,
+			})
+			return fmt.Errorf("failed to upload part %d: %w", partNumber, uploadErr)
+		}
+
+		parts = append(parts, &s3.CompletedPart{
+			ETag:       partResp.ETag,
+			PartNumber: aws.Int64(partNumber),
+		})
+
+		partNumber++
+
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
 		}
 	}
 
-	_, err = s.client.PutObjectWithContext(ctx, input)
-
-	// Return buffer to pool
-	s.largeBufferPool.Put(buf)
-
-	if err != nil {
-		return fmt.Errorf("failed to put object: %w", err)
+	// Complete multipart upload
+	completeInput := &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(realBucket),
+		Key:      aws.String(realKey),
+		UploadId: uploadID,
+		MultipartUpload: &s3.CompletedMultipartUpload{
+			Parts: parts,
+		},
 	}
 
-	s.metadataCache.Delete(fmt.Sprintf("%s/%s", bucket, key))
-	return nil
-}
+	_, err = client.CompleteMultipartUploadWithContext(ctx, completeInput)
+	if err != nil {
+		return fmt.Errorf("failed to complete multipart upload: %w", err)
+	}
 
-// signRequestV4 implements minimal AWS Signature Version 4
-func (s *S3Backend) signRequestV4(req *http.Request) error {
-	// For now, skip signing if using anonymous credentials
-	// Full SigV4 implementation would go here
+	// Invalidate cache
+	s.metadataCache.Delete(fmt.Sprintf("%s/%s", virtualBucket, key))
+
 	return nil
 }

@@ -1,3 +1,4 @@
+// Package metrics provides metrics collection and HTTP endpoints for monitoring.
 package metrics
 
 import (
@@ -303,7 +304,7 @@ type Stats struct {
 	Uptime           time.Duration `json:"uptime"`
 }
 
-// MetricsMiddleware returns a middleware that collects HTTP metrics
+// Middleware returns a middleware that collects HTTP metrics
 func (m *Metrics) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -332,7 +333,9 @@ func (m *Metrics) Middleware() func(http.Handler) http.Handler {
 			m.IncRequest(r.Method, bucket, statusCode, operation)
 			m.ObserveRequestDuration(r.Method, bucket, operation, duration)
 			m.ObserveResponseSize(r.Method, bucket, operation, wrapped.bytesWritten)
-			m.AddBytesTransferred(uint64(wrapped.bytesWritten))
+			if wrapped.bytesWritten > 0 {
+				m.AddBytesTransferred(uint64(wrapped.bytesWritten))
+			}
 
 			if wrapped.statusCode >= 400 {
 				m.IncError()
@@ -417,7 +420,7 @@ func (m *Metrics) StatsHandler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 
 		// Simple JSON encoding without external dependencies
-		fmt.Fprintf(w, `{
+		_, _ = fmt.Fprintf(w, `{
   "total_requests": %d,
   "total_errors": %d,
   "bytes_transferred": %d,

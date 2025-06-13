@@ -1,8 +1,9 @@
+// Package s3 provides S3-compatible API handlers for the proxy server.
 package s3
 
 import (
 	"bytes"
-	"crypto/md5"
+	"crypto/md5" //nolint:gosec // MD5 is required for S3 ETag compatibility
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -13,11 +14,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
+
 	"github.com/einyx/s3proxy-go/internal/auth"
 	"github.com/einyx/s3proxy-go/internal/config"
 	"github.com/einyx/s3proxy-go/internal/storage"
-	"github.com/gorilla/mux"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -32,28 +34,6 @@ var (
 			return make([]byte, 64*1024) // 64KB for medium files
 		},
 	}
-	largeBufferPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 1024*1024) // 1MB buffers
-		},
-	}
-	hugeBufferPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 16*1024*1024) // 16MB buffers
-		},
-	}
-	// Response pool
-	responseWriterPool = sync.Pool{
-		New: func() interface{} {
-			return &zeroCopyResponseWriter{}
-		},
-	}
-	// Context pool
-	contextPool = sync.Pool{
-		New: func() interface{} {
-			return &fastContext{}
-		},
-	}
 )
 
 type Handler struct {
@@ -61,43 +41,6 @@ type Handler struct {
 	auth    auth.Provider
 	config  config.S3Config
 	router  *mux.Router
-}
-
-// zeroCopyResponseWriter implements ultra-fast response writing with zero allocations
-type zeroCopyResponseWriter struct {
-	http.ResponseWriter
-	written int64
-	status  int
-}
-
-func (w *zeroCopyResponseWriter) Write(p []byte) (int, error) {
-	n, err := w.ResponseWriter.Write(p)
-	w.written += int64(n)
-	return n, err
-}
-
-func (w *zeroCopyResponseWriter) WriteHeader(status int) {
-	w.status = status
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w *zeroCopyResponseWriter) Reset(rw http.ResponseWriter) {
-	w.ResponseWriter = rw
-	w.written = 0
-	w.status = 0
-}
-
-// fastContext provides zero-allocation context for request processing
-type fastContext struct {
-	bucket string
-	key    string
-	method string
-}
-
-func (c *fastContext) Reset() {
-	c.bucket = ""
-	c.key = ""
-	c.method = ""
 }
 
 func NewHandler(storage storage.Backend, auth auth.Provider, cfg config.S3Config) *Handler {
@@ -389,7 +332,7 @@ func (h *Handler) getObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		h.sendError(w, err, http.StatusNotFound)
 		return
 	}
-	defer obj.Body.Close()
+	defer func() { _ = obj.Body.Close() }()
 
 	logger.WithFields(logrus.Fields{
 		"size":        obj.Size,
@@ -470,7 +413,7 @@ func (h *Handler) getRangeObject(w http.ResponseWriter, r *http.Request, bucket,
 		h.sendError(w, err, http.StatusNotFound)
 		return
 	}
-	defer obj.Body.Close()
+	defer func() { _ = obj.Body.Close() }()
 
 	// Skip to start position
 	if start > 0 {
@@ -506,7 +449,7 @@ func (h *Handler) getRangeObject(w http.ResponseWriter, r *http.Request, bucket,
 
 	// Copy the requested range
 	buf := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buf)
+	defer bufferPool.Put(&buf)
 
 	if _, err := io.CopyN(w, obj.Body, contentLength); err != nil && !isClientDisconnectError(err) {
 		logrus.WithError(err).Debug("Failed to write range data")
@@ -592,7 +535,7 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	// CRITICAL PUT OPTIMIZATION: Fast path for small files with proper ETag calculation
 	var body io.Reader = r.Body
 	var etag string
-	
+
 	// Handle zero-byte objects (directories) - MD5 of empty string
 	if size == 0 {
 		body = bytes.NewReader([]byte{})
@@ -600,13 +543,13 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	} else if size > 0 && size <= 100*1024 { // <= 100KB
 		buf := smallBufferPool.Get().([]byte)
 		if int64(len(buf)) < size {
-			smallBufferPool.Put(buf)
+			smallBufferPool.Put(&buf)
 			buf = make([]byte, size)
 		} else {
 			buf = buf[:size]
-			defer smallBufferPool.Put(buf)
+			defer smallBufferPool.Put(&buf)
 		}
-		
+
 		// Read entire small file into memory
 		_, err := io.ReadFull(r.Body, buf)
 		if err != nil {
@@ -614,9 +557,9 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, bucket, key 
 			h.sendError(w, err, http.StatusBadRequest)
 			return
 		}
-		
+
 		// Calculate proper MD5 hash for small files
-		hash := md5.Sum(buf)
+		hash := md5.Sum(buf) //nolint:gosec // MD5 is required for S3 ETag compatibility
 		etag = fmt.Sprintf("\"%s\"", hex.EncodeToString(hash[:]))
 		body = bytes.NewReader(buf)
 	}
@@ -630,7 +573,7 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, bucket, key 
 			break
 		}
 	}
-	
+
 	if hasMetadata {
 		metadata = make(map[string]string)
 		for k, v := range r.Header {
@@ -655,7 +598,7 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request, bucket, key 
 	}
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
-	
+
 	if logrus.GetLevel() >= logrus.DebugLevel {
 		logger.WithField("duration", time.Since(start)).Debug("PUT completed")
 	}
@@ -779,11 +722,11 @@ func (h *Handler) sendError(w http.ResponseWriter, err error, status int) {
 
 	enc := xml.NewEncoder(w)
 	enc.Indent("", "  ")
-	if err := enc.Encode(errorResponse{
+	if encErr := enc.Encode(errorResponse{
 		Code:    code,
 		Message: err.Error(),
-	}); err != nil {
-		logrus.WithError(err).Error("Failed to encode error response")
+	}); encErr != nil {
+		logrus.WithError(encErr).Error("Failed to encode error response")
 	}
 }
 
@@ -809,13 +752,13 @@ func (h *Handler) initiateMultipartUpload(w http.ResponseWriter, r *http.Request
 		XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
 		Bucket   string   `xml:"Bucket"`
 		Key      string   `xml:"Key"`
-		UploadId string   `xml:"UploadId"`
+		UploadID string   `xml:"UploadId"`
 	}
 
 	response := initiateMultipartUploadResult{
 		Bucket:   bucket,
 		Key:      key,
-		UploadId: uploadID,
+		UploadID: uploadID,
 	}
 
 	// Build XML response
@@ -967,7 +910,7 @@ func (h *Handler) listParts(w http.ResponseWriter, r *http.Request, bucket, key,
 		XMLName              xml.Name `xml:"ListPartsResult"`
 		Bucket               string   `xml:"Bucket"`
 		Key                  string   `xml:"Key"`
-		UploadId             string   `xml:"UploadId"`
+		UploadID             string   `xml:"UploadId"`
 		PartNumberMarker     int      `xml:"PartNumberMarker"`
 		NextPartNumberMarker int      `xml:"NextPartNumberMarker,omitempty"`
 		MaxParts             int      `xml:"MaxParts"`
@@ -978,7 +921,7 @@ func (h *Handler) listParts(w http.ResponseWriter, r *http.Request, bucket, key,
 	response := listPartsResult{
 		Bucket:               bucket,
 		Key:                  key,
-		UploadId:             uploadID,
+		UploadID:             uploadID,
 		PartNumberMarker:     partNumberMarker,
 		NextPartNumberMarker: result.NextPartNumberMarker,
 		MaxParts:             maxParts,
@@ -1040,7 +983,7 @@ func (h *Handler) getObjectACL(w http.ResponseWriter, r *http.Request, bucket, k
 	response.Owner.DisplayName = acl.Owner.DisplayName
 
 	for _, g := range acl.Grants {
-		grant := grant{
+		grantItem := grant{
 			Permission: g.Permission,
 			Grantee: grantee{
 				Type:        g.Grantee.Type,
@@ -1049,7 +992,7 @@ func (h *Handler) getObjectACL(w http.ResponseWriter, r *http.Request, bucket, k
 				URI:         g.Grantee.URI,
 			},
 		}
-		response.AccessControlList.Grant = append(response.AccessControlList.Grant, grant)
+		response.AccessControlList.Grant = append(response.AccessControlList.Grant, grantItem)
 	}
 
 	w.Header().Set("Content-Type", "application/xml")
@@ -1082,90 +1025,4 @@ func isClientDisconnectError(err error) bool {
 	return strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "connection reset") ||
 		strings.Contains(errStr, "write: connection refused")
-}
-
-// bufferedReader wraps an io.Reader with a buffer pool for high-performance streaming
-type bufferedReader struct {
-	reader io.Reader
-	buf    []byte
-	pos    int
-	end    int
-	eof    bool
-}
-
-func (br *bufferedReader) Read(p []byte) (n int, err error) {
-	// ULTRA AGGRESSIVE: Try to satisfy request directly from buffer first
-	if br.pos < br.end {
-		n = copy(p, br.buf[br.pos:br.end])
-		br.pos += n
-		if n == len(p) {
-			return n, nil // Satisfied entirely from buffer
-		}
-		// Partial satisfaction, continue to fill more
-		p = p[n:]
-	}
-
-	if br.eof {
-		if n > 0 {
-			return n, nil
-		}
-		return 0, io.EOF
-	}
-
-	// If request is larger than our buffer, read directly to avoid copy
-	if len(p) >= len(br.buf) {
-		directN, err := br.reader.Read(p)
-		if err != nil {
-			if err == io.EOF {
-				br.eof = true
-			}
-		}
-		return n + directN, err
-	}
-
-	// Fill buffer for smaller requests
-	br.pos = 0
-	br.end, err = br.reader.Read(br.buf)
-	if err != nil {
-		if err == io.EOF {
-			br.eof = true
-		} else {
-			return n, err
-		}
-	}
-
-	// Copy from freshly filled buffer
-	additionalN := copy(p, br.buf[br.pos:br.end])
-	br.pos += additionalN
-
-	return n + additionalN, nil
-}
-
-// speedReader is an ultra-optimized reader for maximum PUT performance
-type speedReader struct {
-	reader io.Reader
-	size   int64
-	read   int64
-}
-
-func (sr *speedReader) Read(p []byte) (n int, err error) {
-	if sr.read >= sr.size {
-		return 0, io.EOF
-	}
-
-	// Calculate remaining bytes
-	remaining := sr.size - sr.read
-	if int64(len(p)) > remaining {
-		p = p[:remaining]
-	}
-
-	n, err = sr.reader.Read(p)
-	sr.read += int64(n)
-
-	// Force EOF when we've read exactly the expected size
-	if sr.read >= sr.size && err == nil {
-		err = io.EOF
-	}
-
-	return n, err
 }

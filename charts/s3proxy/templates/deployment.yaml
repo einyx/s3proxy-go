@@ -223,6 +223,47 @@ spec:
             {{- end }}
             {{- end }}
 
+            # Encryption configuration
+            - name: ENCRYPTION_ENABLED
+              value: {{ .Values.config.encryption.enabled | quote }}
+            {{- if .Values.config.encryption.enabled }}
+            - name: ENCRYPTION_ALGORITHM
+              value: {{ .Values.config.encryption.algorithm | quote }}
+            - name: ENCRYPTION_KEY_PROVIDER
+              value: {{ .Values.config.encryption.keyProvider | quote }}
+
+            {{- if eq .Values.config.encryption.keyProvider "local" }}
+            {{- if and .Values.externalSecrets.enabled .Values.externalSecrets.encryption.enabled }}
+            # Using ExternalSecrets for encryption keys
+            - name: ENCRYPTION_LOCAL_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalSecrets.encryption.targetSecretName }}
+                  key: ENCRYPTION_LOCAL_MASTER_KEY
+            {{- else if .Values.config.encryption.local.masterKey }}
+            # Using traditional secret management
+            - name: ENCRYPTION_LOCAL_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "s3proxy.fullname" . }}
+                  key: encryption-master-key
+            {{- end }}
+            {{- end }}
+
+            {{- if eq .Values.config.encryption.keyProvider "kms" }}
+            {{- if .Values.config.encryption.kms.keyId }}
+            - name: ENCRYPTION_KMS_KEY_ID
+              value: {{ .Values.config.encryption.kms.keyId | quote }}
+            {{- end }}
+            {{- if .Values.config.encryption.kms.region }}
+            - name: ENCRYPTION_KMS_REGION
+              value: {{ .Values.config.encryption.kms.region | quote }}
+            {{- end }}
+            - name: ENCRYPTION_KMS_CACHE_TTL
+              value: {{ .Values.config.encryption.kms.cacheTTL | quote }}
+            {{- end }}
+            {{- end }}
+
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:

@@ -1,9 +1,10 @@
+// Package storage provides storage backend implementations for Azure Blob Storage.
 package storage
 
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/md5" //nolint:gosec // MD5 is required for Azure ETag compatibility
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -13,8 +14,9 @@ import (
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/einyx/s3proxy-go/internal/config"
 	"github.com/sirupsen/logrus"
+
+	"github.com/einyx/s3proxy-go/internal/config"
 )
 
 type AzureBackend struct {
@@ -65,10 +67,10 @@ func NewAzureBackend(cfg *config.AzureStorageConfig) (*AzureBackend, error) {
 	pipelineOptions := azblob.PipelineOptions{
 		Retry: azblob.RetryOptions{
 			Policy:        azblob.RetryPolicyExponential,
-			MaxTries:      2, // Reduced retries for faster failures
-			TryTimeout:    120 * time.Second, // Increased timeout for large files
+			MaxTries:      2,                      // Reduced retries for faster failures
+			TryTimeout:    120 * time.Second,      // Increased timeout for large files
 			RetryDelay:    500 * time.Millisecond, // Faster retry
-			MaxRetryDelay: 5 * time.Second, // Reduced max delay
+			MaxRetryDelay: 5 * time.Second,        // Reduced max delay
 		},
 		Telemetry: azblob.TelemetryOptions{
 			Value: "s3proxy-turbo/2.0",
@@ -155,8 +157,13 @@ func (a *AzureBackend) ListObjectsWithDelimiter(ctx context.Context, bucket, pre
 	containerURL := a.serviceURL.NewContainerURL(bucket)
 
 	options := azblob.ListBlobsSegmentOptions{
-		Prefix:     prefix,
-		MaxResults: int32(maxKeys),
+		Prefix: prefix,
+		MaxResults: func() int32 {
+			if maxKeys > 0x7FFFFFFF {
+				return 0x7FFFFFFF
+			}
+			return int32(maxKeys) //nolint:gosec // maxKeys is bounded by check above
+		}(),
 	}
 
 	result := &ListObjectsResult{
@@ -193,18 +200,19 @@ func (a *AzureBackend) ListObjectsWithDelimiter(ctx context.Context, bucket, pre
 					}
 				}
 			}
-			
+
 			// Use stored MD5 hash as ETag for S3 compatibility
 			etag := string(blob.Properties.Etag)
 			if md5Hash, exists := blob.Metadata["s3proxyMD5"]; exists {
 				etag = fmt.Sprintf("\"%s\"", md5Hash)
 			}
-			
+
 			result.Contents = append(result.Contents, ObjectInfo{
 				Key:          key,
 				Size:         *blob.Properties.ContentLength,
 				ETag:         etag,
 				LastModified: blob.Properties.LastModified,
+				Metadata:     desanitizeAzureMetadata(blob.Metadata),
 			})
 		}
 
@@ -240,12 +248,13 @@ func (a *AzureBackend) ListObjectsWithDelimiter(ctx context.Context, bucket, pre
 					}
 				}
 			}
-			
+
 			result.Contents = append(result.Contents, ObjectInfo{
 				Key:          key,
 				Size:         *blob.Properties.ContentLength,
 				ETag:         string(blob.Properties.Etag),
 				LastModified: blob.Properties.LastModified,
+				Metadata:     desanitizeAzureMetadata(blob.Metadata),
 			})
 		}
 
@@ -260,13 +269,13 @@ func (a *AzureBackend) ListObjectsWithDelimiter(ctx context.Context, bucket, pre
 
 func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	
+
 	// Handle directory-like objects
 	normalizedKey := key
 	if strings.HasSuffix(key, "/") && key != "/" {
 		normalizedKey = strings.TrimSuffix(key, "/") + "/.dir"
 	}
-	
+
 	blobURL := containerURL.NewBlobURL(normalizedKey)
 
 	// Get properties first for metadata
@@ -274,66 +283,37 @@ func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Obje
 	if err != nil {
 		return nil, fmt.Errorf("failed to get blob properties: %w", err)
 	}
-	
+
 	// AGGRESSIVE GET OPTIMIZATION: Tuned strategies for benchmark sizes
 	size := props.ContentLength()
-	
-	// For 10MB files: Use parallel download reader for maximum throughput
-	if size >= 8*1024*1024 && size <= 12*1024*1024 {
-		// Create parallel download reader for 10MB files
-		reader := &parallelDownloadReader{
-			ctx:         ctx,
-			blobURL:     blobURL,
-			size:        size,
-			chunkSize:   2 * 1024 * 1024, // 2MB chunks for 10MB files
-			concurrency: 5,                // 5 parallel chunks
-			bufferChan:  make(chan *downloadBuffer, 10),
-		}
-		
-		// Start parallel downloads
-		go reader.startDownloads()
-		
-		// Use stored MD5 hash as ETag for S3 compatibility
-		metadata := props.NewMetadata()
-		etag := string(props.ETag())
-		if md5Hash, exists := metadata["s3proxyMD5"]; exists {
-			etag = fmt.Sprintf("\"%s\"", md5Hash)
-		}
-		
-		return &Object{
-			Body:         reader,
-			ContentType:  props.ContentType(),
-			Size:         size,
-			ETag:         etag,
-			LastModified: props.LastModified(),
-			Metadata:     metadata,
-		}, nil
-	}
-	
-	// For files >= 1MB (but not 10MB), use block blob URL with optimized reader
-	if size >= 1024*1024 {
+
+	// For files >= 1MB, use optimized reader unless encrypted (buffering corrupts encrypted data)
+	if size >= 1024*1024 && !isEncryptedMetadata(props.NewMetadata()) {
 		blockBlobURL := containerURL.NewBlockBlobURL(key)
-		
+
 		// Download with minimal retry for speed
-		resp, err := blockBlobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to download blob: %w", err)
+		resp, downloadErr := blockBlobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
+		if downloadErr != nil {
+			return nil, fmt.Errorf("failed to download blob: %w", downloadErr)
 		}
-		
+
 		// Use retry reader with minimal retries for speed
 		bodyStream := resp.Body(azblob.RetryReaderOptions{
 			MaxRetryRequests: 1, // Reduced for speed
 		})
-		
+
 		// Use stored MD5 hash as ETag for S3 compatibility
-		metadata := props.NewMetadata()
+		metadata := desanitizeAzureMetadata(props.NewMetadata())
 		etag := string(props.ETag())
 		if md5Hash, exists := metadata["s3proxyMD5"]; exists {
 			etag = fmt.Sprintf("\"%s\"", md5Hash)
 		}
-		
+
+		// Use optimized reader for non-encrypted files only
+		body := wrapWithOptimizedReader(bodyStream, size, isEncryptedMetadata(props.NewMetadata()))
+
 		return &Object{
-			Body:         &azureHighPerfReader{ReadCloser: bodyStream, size: size},
+			Body:         body,
 			ContentType:  props.ContentType(),
 			Size:         size,
 			ETag:         etag,
@@ -341,7 +321,7 @@ func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Obje
 			Metadata:     metadata,
 		}, nil
 	}
-	
+
 	// For smaller files, use single download with buffering
 	resp, err := blobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
@@ -353,14 +333,17 @@ func (a *AzureBackend) GetObject(ctx context.Context, bucket, key string) (*Obje
 	})
 
 	// Use stored MD5 hash as ETag for S3 compatibility
-	metadata := resp.NewMetadata()
+	metadata := desanitizeAzureMetadata(resp.NewMetadata())
 	etag := string(resp.ETag())
 	if md5Hash, exists := metadata["s3proxyMD5"]; exists {
 		etag = fmt.Sprintf("\"%s\"", md5Hash)
 	}
-	
+
+	// Use optimized reader for non-encrypted files only
+	body2 := wrapWithFastReader(bodyStream, size, isEncryptedMetadata(resp.NewMetadata()))
+
 	return &Object{
-		Body:         &azureFastReader{ReadCloser: bodyStream, size: size},
+		Body:         body2,
 		ContentType:  resp.ContentType(),
 		Size:         size,
 		ETag:         etag,
@@ -383,7 +366,7 @@ func (r *azureHighPerfReader) Read(p []byte) (n int, err error) {
 	if len(p) >= 1024*1024 {
 		return r.ReadCloser.Read(p)
 	}
-	
+
 	// For medium reads (>= 64KB), use larger buffer
 	if len(p) >= 64*1024 {
 		if r.buf == nil || len(r.buf) < 512*1024 {
@@ -395,7 +378,7 @@ func (r *azureHighPerfReader) Read(p []byte) (n int, err error) {
 			r.buf = make([]byte, 64*1024) // 64KB buffer for small reads
 		}
 	}
-	
+
 	// Refill buffer if empty
 	if r.pos >= r.n {
 		r.n, err = r.ReadCloser.Read(r.buf)
@@ -404,7 +387,7 @@ func (r *azureHighPerfReader) Read(p []byte) (n int, err error) {
 		}
 		r.pos = 0
 	}
-	
+
 	// Copy from buffer
 	n = copy(p, r.buf[r.pos:r.n])
 	r.pos += n
@@ -425,12 +408,12 @@ func (r *azureFastReader) Read(p []byte) (n int, err error) {
 	if len(p) >= 256*1024 { // 256KB or larger - reduced threshold
 		return r.ReadCloser.Read(p)
 	}
-	
+
 	// Buffer smaller reads
 	if r.buf == nil {
 		r.buf = make([]byte, 256*1024) // 256KB buffer - more reasonable size
 	}
-	
+
 	// Refill buffer if empty
 	if r.pos >= r.n {
 		r.n, err = r.ReadCloser.Read(r.buf)
@@ -439,7 +422,7 @@ func (r *azureFastReader) Read(p []byte) (n int, err error) {
 		}
 		r.pos = 0
 	}
-	
+
 	// Copy from buffer
 	n = copy(p, r.buf[r.pos:r.n])
 	r.pos += n
@@ -450,6 +433,7 @@ func (r *azureFastReader) Read(p []byte) (n int, err error) {
 type azureFastUploadReader struct {
 	io.Reader
 	buf []byte
+	pos int
 	n   int
 	err error
 }
@@ -459,53 +443,150 @@ func (r *azureFastUploadReader) Read(p []byte) (n int, err error) {
 	if len(p) >= 1024*1024 { // 1MB or larger
 		return r.Reader.Read(p)
 	}
-	
+
 	// Buffer smaller reads
 	if r.buf == nil {
 		r.buf = make([]byte, 1024*1024) // 1MB buffer
 	}
-	
-	// Fill buffer if empty
-	if r.n == 0 && r.err == nil {
+
+	// Fill buffer if empty and no previous EOF
+	if r.pos >= r.n {
+		if r.err != nil {
+			return 0, r.err
+		}
 		r.n, r.err = r.Reader.Read(r.buf)
+		r.pos = 0
+		if r.n == 0 {
+			return 0, r.err
+		}
 	}
-	
+
 	// Copy from buffer
-	if r.n > 0 {
-		n = copy(p, r.buf[:r.n])
-		copy(r.buf, r.buf[n:r.n])
-		r.n -= n
+	if r.pos < r.n {
+		n = copy(p, r.buf[r.pos:r.n])
+		r.pos += n
 		return n, nil
 	}
-	
+
 	return 0, r.err
+}
+
+// Known metadata key mappings for encryption
+var azureMetadataMapping = map[string]string{
+	"x-amz-meta-encryption-algorithm": "xamzmetaencryptionalgorithm",
+	"x-amz-meta-encryption-key-id":    "xamzmetaencryptionkeyid",
+	"x-amz-meta-encryption-dek":       "xamzmetaencryptiondek",
+	"x-amz-meta-encryption-nonce":     "xamzmetaencryptionnonce",
+	"x-amz-meta-encrypted-size":       "xamzmetaencryptedsize",
+	"x-amz-server-side-encryption":    "xamzserversideencryption",
+	"x-encryption-key":                "xencryptionkey",
+	"x-encryption-algorithm":          "xencryptionalgorithm",
+	"timestamp":                       "timestamp",
+	"test":                            "test",
+	"s3proxymd5":                      "s3proxyMD5",
+	"s3proxydirectorymarker":          "s3proxyDirectoryMarker",
+	"s3proxyoriginalkey":              "s3proxyOriginalKey",
+	"content-type":                    "contenttype",
+}
+
+// Reverse mapping for reading metadata
+var azureMetadataReverseMapping = map[string]string{
+	"xamzmetaencryptionalgorithm": "x-amz-meta-encryption-algorithm",
+	"xamzmetaencryptionkeyid":     "x-amz-meta-encryption-key-id",
+	"xamzmetaencryptiondek":       "x-amz-meta-encryption-dek",
+	"xamzmetaencryptionnonce":     "x-amz-meta-encryption-nonce",
+	"xamzmetaencryptedsize":       "x-amz-meta-encrypted-size",
+	"xamzserversideencryption":    "x-amz-server-side-encryption",
+	"xencryptionkey":              "x-encryption-key",
+	"xencryptionalgorithm":        "x-encryption-algorithm",
+	"s3proxymd5":                  "s3proxyMD5",
+	"s3proxydirectorymarker":      "s3proxyDirectoryMarker",
+	"contenttype":                 "content-type",
+	"s3proxyoriginalkey":          "s3proxyOriginalKey",
+}
+
+// sanitizeAzureMetadata converts metadata keys to Azure-compatible format
+func sanitizeAzureMetadata(metadata map[string]string) map[string]string {
+	if metadata == nil {
+		return make(map[string]string)
+	}
+
+	sanitized := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		// Check if we have a known mapping
+		if mappedKey, exists := azureMetadataMapping[strings.ToLower(k)]; exists {
+			sanitized[mappedKey] = v
+			continue
+		}
+
+		// Otherwise, sanitize the key
+		sanitizedKey := ""
+		for i, ch := range k {
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+				sanitizedKey += string(ch)
+			} else if ch >= '0' && ch <= '9' {
+				if i > 0 {
+					sanitizedKey += string(ch)
+				}
+			}
+			// Skip special characters
+		}
+
+		// Ensure key starts with a letter
+		if sanitizedKey != "" {
+			if sanitizedKey[0] >= '0' && sanitizedKey[0] <= '9' {
+				sanitizedKey = "x" + sanitizedKey
+			}
+			sanitized[sanitizedKey] = v
+		}
+	}
+	return sanitized
+}
+
+// desanitizeAzureMetadata converts Azure metadata keys back to original format
+func desanitizeAzureMetadata(metadata map[string]string) map[string]string {
+	if metadata == nil {
+		return nil
+	}
+
+	desanitized := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		// Check if we have a reverse mapping
+		if originalKey, exists := azureMetadataReverseMapping[strings.ToLower(k)]; exists {
+			desanitized[originalKey] = v
+		} else {
+			// Keep as-is for unknown keys
+			desanitized[k] = v
+		}
+	}
+	return desanitized
 }
 
 func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, metadata map[string]string) error {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	
+
 	logrus.WithFields(logrus.Fields{
 		"bucket": bucket,
 		"key":    key,
 		"size":   size,
 	}).Info("Azure PutObject called")
-	
-	// Initialize metadata if nil
-	if metadata == nil {
-		metadata = make(map[string]string)
-	}
-	
+
+	// Sanitize metadata for Azure
+	logrus.WithField("originalMetadata", metadata).Debug("Before sanitization")
+	metadata = sanitizeAzureMetadata(metadata)
+	logrus.WithField("sanitizedMetadata", metadata).Debug("After sanitization")
+
 	// Handle directory-like objects (keys ending with /)
 	// Azure doesn't allow blob names ending with /, so normalize them
 	normalizedKey := key
 	if strings.HasSuffix(key, "/") && key != "/" {
 		logrus.WithField("key", key).Info("Converting directory-like object to .dir marker")
-		
+
 		// For S3A compatibility: when creating a directory marker, we need to ensure
 		// there's no conflicting file at the path without trailing slash
 		baseKey := strings.TrimSuffix(key, "/")
 		baseBlobURL := containerURL.NewBlobURL(baseKey)
-		
+
 		// Check if there's a conflicting file and delete it if it exists
 		_, err := baseBlobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 		if err == nil {
@@ -515,7 +596,7 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 				logrus.WithError(deleteErr).WithField("key", baseKey).Warn("Failed to delete conflicting file")
 			}
 		}
-		
+
 		// For directory markers, create a special blob without the trailing slash
 		// and add metadata to indicate it's a directory marker
 		normalizedKey = strings.TrimSuffix(key, "/") + "/.dir"
@@ -523,13 +604,13 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 		metadata["s3proxyOriginalKey"] = key
 		// For empty directory markers, always use MD5 of empty string
 		metadata["s3proxyMD5"] = "d41d8cd98f00b204e9800998ecf8427e"
-		
+
 		logrus.WithFields(logrus.Fields{
 			"originalKey":   key,
 			"normalizedKey": normalizedKey,
 		}).Info("Directory marker will be stored")
 	}
-	
+
 	blobURL := containerURL.NewBlockBlobURL(normalizedKey)
 
 	// AGGRESSIVE PUT OPTIMIZATION: Maximum performance approach
@@ -539,58 +620,58 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 		if br, ok := reader.(*bytes.Reader); ok {
 			// Already buffered, reuse
 			data = make([]byte, size)
-			br.Read(data)
-			br.Seek(0, 0) // Reset for potential retry
+			_, _ = br.Read(data)
+			_, _ = br.Seek(0, 0) // Reset for potential retry
 		} else {
 			// Read into memory
 			data = a.bufferPool.Get().([]byte)
 			if len(data) < int(size) {
-				a.bufferPool.Put(data)
+				a.bufferPool.Put(&data)
 				data = make([]byte, size)
 			} else {
 				data = data[:size]
-				defer a.bufferPool.Put(data)
+				defer a.bufferPool.Put(&data)
 			}
-			
+
 			_, err := io.ReadFull(reader, data)
 			if err != nil {
 				return fmt.Errorf("failed to read data: %w", err)
 			}
 		}
-		
+
 		// Calculate MD5 hash for S3 compatibility
-		hash := md5.Sum(data)
+		hash := md5.Sum(data) //nolint:gosec // MD5 is required for Azure ETag compatibility
 		metadata["s3proxyMD5"] = hex.EncodeToString(hash[:])
-		
+
 		// Fast upload with minimal overhead
 		httpHeaders := azblob.BlobHTTPHeaders{
 			ContentType: "application/octet-stream",
 		}
-		
-		_, err := blobURL.Upload(ctx, bytes.NewReader(data), httpHeaders, 
-			azblob.Metadata(metadata), azblob.BlobAccessConditions{}, 
-			azblob.DefaultAccessTier, nil, azblob.ClientProvidedKeyOptions{}, 
+
+		_, err := blobURL.Upload(ctx, bytes.NewReader(data), httpHeaders,
+			azblob.Metadata(metadata), azblob.BlobAccessConditions{},
+			azblob.DefaultAccessTier, nil, azblob.ClientProvidedKeyOptions{},
 			azblob.ImmutabilityPolicyOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to upload blob: %w", err)
 		}
 		return nil
 	}
-	
+
 	// For larger files, we can't easily calculate MD5 without reading the entire content
 	// For now, generate a deterministic ETag based on size and timestamp
 	// This is not ideal but maintains compatibility for large files
 	if _, exists := metadata["s3proxyMD5"]; !exists {
 		metadata["s3proxyMD5"] = fmt.Sprintf("large-file-%d-%d", size, time.Now().Unix())
 	}
-	
+
 	// ULTRA-HIGH PERFORMANCE STREAMING
 	// Direct reader without extra buffering layer for maximum speed
-	
+
 	// AGGRESSIVE: Optimized buffer sizes for each benchmark
 	var bufferSize int
 	var maxBuffers int
-	
+
 	if size >= 8*1024*1024 && size <= 12*1024*1024 { // 10MB: EXTREME PERFORMANCE
 		// Special optimization for 10MB benchmark
 		bufferSize = 2 * 1024 * 1024 // 2MB buffers
@@ -610,16 +691,16 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 		return nil
 	} else if size >= 1024*1024 { // >= 1MB: HIGH PERFORMANCE
 		// Optimized for 1MB benchmark
-		bufferSize = 512 * 1024      // 512KB buffers
-		maxBuffers = 8               // 8 concurrent = 4MB in flight
+		bufferSize = 512 * 1024 // 512KB buffers
+		maxBuffers = 8          // 8 concurrent = 4MB in flight
 	} else { // 256KB - 1MB: MODERATE
-		bufferSize = 256 * 1024      // 256KB buffers
-		maxBuffers = 4               // 4 concurrent = 1MB in flight
+		bufferSize = 256 * 1024 // 256KB buffers
+		maxBuffers = 4          // 4 concurrent = 1MB in flight
 	}
 
 	// Use buffered reader for non-10MB files
 	bufferedReader := &azureFastUploadReader{Reader: reader}
-	
+
 	_, err := azblob.UploadStreamToBlockBlob(ctx, bufferedReader, blobURL, azblob.UploadStreamToBlockBlobOptions{
 		BufferSize: bufferSize,
 		MaxBuffers: maxBuffers,
@@ -637,13 +718,13 @@ func (a *AzureBackend) PutObject(ctx context.Context, bucket, key string, reader
 
 func (a *AzureBackend) DeleteObject(ctx context.Context, bucket, key string) error {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	
+
 	// Handle directory-like objects
 	normalizedKey := key
 	if strings.HasSuffix(key, "/") && key != "/" {
 		normalizedKey = strings.TrimSuffix(key, "/") + "/.dir"
 	}
-	
+
 	blobURL := containerURL.NewBlobURL(normalizedKey)
 
 	_, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{})
@@ -656,23 +737,23 @@ func (a *AzureBackend) DeleteObject(ctx context.Context, bucket, key string) err
 
 func (a *AzureBackend) HeadObject(ctx context.Context, bucket, key string) (*ObjectInfo, error) {
 	containerURL := a.serviceURL.NewContainerURL(bucket)
-	
+
 	logrus.WithFields(logrus.Fields{
 		"bucket": bucket,
 		"key":    key,
 	}).Info("Azure HeadObject called")
-	
+
 	// For S3A compatibility: if the key doesn't end with /, check for actual file first
 	// If no file exists but there's a directory marker, return 404 to allow directory creation
 	if !strings.HasSuffix(key, "/") {
 		logrus.WithField("key", key).Info("Checking for actual file (non-slash key)")
-		
+
 		// Check for actual file
 		blobURL := containerURL.NewBlobURL(key)
 		props, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 		if err == nil {
 			logrus.WithField("key", key).Info("Found actual file - checking if it's a directory marker")
-			
+
 			// Found actual file - check if it's a directory marker
 			metadata := props.NewMetadata()
 			if isDir, exists := metadata["s3proxyDirectoryMarker"]; exists && isDir == "true" {
@@ -681,7 +762,7 @@ func (a *AzureBackend) HeadObject(ctx context.Context, bucket, key string) (*Obj
 				// but if it does, we should return 404 to allow S3A to create proper directory
 				return nil, fmt.Errorf("object not found")
 			}
-			
+
 			// Check for Azure HDI (Hierarchical Data Interface) folder markers
 			// Note: Azure metadata keys can have different casing
 			if hdiFolder, exists := metadata["hdi_isfolder"]; exists && hdiFolder == "true" {
@@ -694,30 +775,30 @@ func (a *AzureBackend) HeadObject(ctx context.Context, bucket, key string) (*Obj
 				// Azure created this as a folder marker, treat it as directory for S3A compatibility
 				return nil, fmt.Errorf("object not found")
 			}
-			
+
 			// Use stored MD5 hash as ETag for S3 compatibility
 			etag := string(props.ETag())
 			if md5Hash, exists := metadata["s3proxyMD5"]; exists {
 				etag = fmt.Sprintf("\"%s\"", md5Hash)
 			}
-			
+
 			logrus.WithFields(logrus.Fields{
 				"key":  key,
 				"size": props.ContentLength(),
 				"etag": etag,
 			}).Info("Returning actual file info")
-			
+
 			return &ObjectInfo{
 				Key:          key,
 				Size:         props.ContentLength(),
 				ETag:         etag,
 				LastModified: props.LastModified(),
-				Metadata:     metadata,
+				Metadata:     desanitizeAzureMetadata(metadata),
 			}, nil
 		}
-		
+
 		logrus.WithField("key", key).Info("No actual file found - checking for directory marker")
-		
+
 		// No actual file found, check if there's a directory marker
 		dirMarkerKey := key + "/.dir"
 		dirBlobURL := containerURL.NewBlobURL(dirMarkerKey)
@@ -727,12 +808,12 @@ func (a *AzureBackend) HeadObject(ctx context.Context, bucket, key string) (*Obj
 			// Directory marker exists, return 404 for the file path to allow S3A directory creation
 			return nil, fmt.Errorf("object not found")
 		}
-		
+
 		logrus.WithField("key", key).Info("Neither file nor directory marker found - returning 404")
 		// Neither file nor directory marker found - return original error
 		return nil, fmt.Errorf("failed to get blob properties: %w", err)
 	}
-	
+
 	// Handle directory-like objects (keys ending with /)
 	normalizedKey := strings.TrimSuffix(key, "/") + "/.dir"
 	blobURL := containerURL.NewBlobURL(normalizedKey)
@@ -750,19 +831,19 @@ func (a *AzureBackend) HeadObject(ctx context.Context, bucket, key string) (*Obj
 			resultKey = origKey
 		}
 	}
-	
+
 	// Use stored MD5 hash as ETag for S3 compatibility
 	etag := string(props.ETag())
 	if md5Hash, exists := metadata["s3proxyMD5"]; exists {
 		etag = fmt.Sprintf("\"%s\"", md5Hash)
 	}
-	
+
 	return &ObjectInfo{
 		Key:          resultKey,
 		Size:         props.ContentLength(),
 		ETag:         etag,
 		LastModified: props.LastModified(),
-		Metadata:     metadata,
+		Metadata:     desanitizeAzureMetadata(metadata),
 	}, nil
 }
 
@@ -876,325 +957,23 @@ func (a *AzureBackend) ListParts(ctx context.Context, bucket, key, uploadID stri
 	return result, nil
 }
 
-// optimizedReader implements efficient chunk-based reading with prefetching
-type optimizedReader struct {
-	ctx       context.Context
-	blobURL   azblob.BlobURL
-	totalSize int64
-	chunkSize int64
-	prefetch  int
-
-	currentChunk  []byte
-	currentOffset int64
-	chunkIndex    int64
-
-	prefetchChan   chan *chunk
-	prefetchCancel context.CancelFunc
-	wg             sync.WaitGroup
+// isEncryptedMetadata checks if the metadata indicates an encrypted object
+func isEncryptedMetadata(metadata map[string]string) bool {
+	return metadata["xamzmetaencryptionalgorithm"] != ""
 }
 
-type chunk struct {
-	index int64
-	data  []byte
-	err   error
+// wrapWithOptimizedReader wraps the stream with high-performance reader for large files, unless encrypted
+func wrapWithOptimizedReader(stream io.ReadCloser, size int64, isEncrypted bool) io.ReadCloser {
+	if isEncrypted {
+		return stream // No optimization for encrypted data to prevent corruption
+	}
+	return &azureHighPerfReader{ReadCloser: stream, size: size}
 }
 
-func (r *optimizedReader) Start() error {
-	// Create prefetch context
-	prefetchCtx, cancel := context.WithCancel(r.ctx)
-	r.prefetchCancel = cancel
-
-	// Start prefetch channel
-	r.prefetchChan = make(chan *chunk, r.prefetch)
-
-	// Start prefetching
-	r.wg.Add(1)
-	go r.prefetchLoop(prefetchCtx)
-
-	return nil
-}
-
-func (r *optimizedReader) prefetchLoop(ctx context.Context) {
-	defer r.wg.Done()
-	defer close(r.prefetchChan)
-
-	nextChunk := int64(0)
-	numChunks := (r.totalSize + r.chunkSize - 1) / r.chunkSize
-
-	// Prefetch initial chunks
-	for i := 0; i < r.prefetch && nextChunk < numChunks; i++ {
-		select {
-		case <-ctx.Done():
-			return
-		case r.prefetchChan <- r.downloadChunk(ctx, nextChunk):
-			nextChunk++
-		}
+// wrapWithFastReader wraps the stream with fast reader for smaller files, unless encrypted
+func wrapWithFastReader(stream io.ReadCloser, size int64, isEncrypted bool) io.ReadCloser {
+	if isEncrypted {
+		return stream // No optimization for encrypted data to prevent corruption
 	}
-
-	// Continue prefetching as chunks are consumed
-	for nextChunk < numChunks {
-		select {
-		case <-ctx.Done():
-			return
-		case r.prefetchChan <- r.downloadChunk(ctx, nextChunk):
-			nextChunk++
-		}
-	}
-}
-
-func (r *optimizedReader) downloadChunk(ctx context.Context, index int64) *chunk {
-	offset := index * r.chunkSize
-	count := r.chunkSize
-	if offset+count > r.totalSize {
-		count = r.totalSize - offset
-	}
-
-	// Download with retry
-	for retry := 0; retry < 3; retry++ {
-		select {
-		case <-ctx.Done():
-			return &chunk{index: index, err: ctx.Err()}
-		default:
-		}
-
-		resp, err := r.blobURL.Download(ctx, offset, count, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
-		if err != nil {
-			if retry < 2 {
-				time.Sleep(time.Millisecond * 50 * time.Duration(retry+1))
-				continue
-			}
-			return &chunk{index: index, err: err}
-		}
-
-		bodyStream := resp.Body(azblob.RetryReaderOptions{MaxRetryRequests: 1})
-		data, err := io.ReadAll(bodyStream)
-		bodyStream.Close()
-
-		if err == nil {
-			return &chunk{index: index, data: data}
-		}
-
-		if retry < 2 {
-			time.Sleep(time.Millisecond * 50 * time.Duration(retry+1))
-		}
-	}
-
-	return &chunk{index: index, err: fmt.Errorf("failed after retries")}
-}
-
-func (r *optimizedReader) Read(p []byte) (n int, err error) {
-	if r.currentOffset >= r.totalSize {
-		return 0, io.EOF
-	}
-
-	totalRead := 0
-
-	for totalRead < len(p) && r.currentOffset < r.totalSize {
-		// Load next chunk if needed
-		if r.currentChunk == nil || int64(len(r.currentChunk)) <= r.currentOffset%r.chunkSize {
-			select {
-			case chunk := <-r.prefetchChan:
-				if chunk == nil {
-					return totalRead, io.ErrUnexpectedEOF
-				}
-				if chunk.err != nil {
-					return totalRead, chunk.err
-				}
-				r.currentChunk = chunk.data
-				r.chunkIndex = chunk.index
-			case <-r.ctx.Done():
-				return totalRead, r.ctx.Err()
-			}
-		}
-
-		// Copy from current chunk
-		chunkOffset := r.currentOffset % r.chunkSize
-		available := int64(len(r.currentChunk)) - chunkOffset
-		toCopy := int64(len(p) - totalRead)
-		if toCopy > available {
-			toCopy = available
-		}
-
-		copy(p[totalRead:], r.currentChunk[chunkOffset:chunkOffset+toCopy])
-		totalRead += int(toCopy)
-		r.currentOffset += toCopy
-
-		// Clear chunk if fully consumed
-		if chunkOffset+toCopy >= int64(len(r.currentChunk)) {
-			r.currentChunk = nil
-		}
-	}
-
-	return totalRead, nil
-}
-
-func (r *optimizedReader) Close() error {
-	if r.prefetchCancel != nil {
-		r.prefetchCancel()
-	}
-	r.wg.Wait()
-	return nil
-}
-
-// parallelDownloadReader implements high-performance parallel downloading for large blobs
-type parallelDownloadReader struct {
-	ctx         context.Context
-	blobURL     azblob.BlobURL
-	size        int64
-	chunkSize   int64
-	concurrency int
-	bufferChan  chan *downloadBuffer
-	position    int64
-	current     *downloadBuffer
-	err         error
-	mu          sync.Mutex
-	wg          sync.WaitGroup
-	closed      bool
-}
-
-type downloadBuffer struct {
-	offset int64
-	data   []byte
-	err    error
-}
-
-func (r *parallelDownloadReader) startDownloads() {
-	defer close(r.bufferChan)
-	
-	// Calculate total chunks
-	totalChunks := (r.size + r.chunkSize - 1) / r.chunkSize
-	
-	// Use semaphore to limit concurrency
-	sem := make(chan struct{}, r.concurrency)
-	
-	for i := int64(0); i < totalChunks; i++ {
-		offset := i * r.chunkSize
-		count := r.chunkSize
-		if offset+count > r.size {
-			count = r.size - offset
-		}
-		
-		r.wg.Add(1)
-		go func(offset, count int64) {
-			defer r.wg.Done()
-			
-			// Acquire semaphore
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			
-			// Download chunk with retries
-			var data []byte
-			var err error
-			for retry := 0; retry < 3; retry++ {
-				resp, downloadErr := r.blobURL.Download(r.ctx, offset, count, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
-				if downloadErr != nil {
-					err = downloadErr
-					if retry < 2 {
-						time.Sleep(time.Millisecond * 100 * time.Duration(retry+1))
-						continue
-					}
-					break
-				}
-				
-				// Read data
-				bodyStream := resp.Body(azblob.RetryReaderOptions{MaxRetryRequests: 1})
-				data, err = io.ReadAll(bodyStream)
-				bodyStream.Close()
-				
-				if err == nil {
-					break
-				}
-			}
-			
-			// Send to channel
-			select {
-			case r.bufferChan <- &downloadBuffer{offset: offset, data: data, err: err}:
-			case <-r.ctx.Done():
-				return
-			}
-		}(offset, count)
-	}
-	
-	// Wait for all downloads to complete
-	r.wg.Wait()
-}
-
-func (r *parallelDownloadReader) Read(p []byte) (n int, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	
-	if r.err != nil {
-		return 0, r.err
-	}
-	
-	if r.position >= r.size {
-		return 0, io.EOF
-	}
-	
-	totalRead := 0
-	
-	for totalRead < len(p) && r.position < r.size {
-		// Get current buffer if needed
-		if r.current == nil || r.position < r.current.offset || r.position >= r.current.offset+int64(len(r.current.data)) {
-			// Find the right buffer
-			targetOffset := (r.position / r.chunkSize) * r.chunkSize
-			
-			// Get buffer from channel
-			for {
-				select {
-				case buf, ok := <-r.bufferChan:
-					if !ok {
-						if totalRead > 0 {
-							return totalRead, nil
-						}
-						return 0, io.EOF
-					}
-					
-					if buf.err != nil {
-						r.err = buf.err
-						return totalRead, buf.err
-					}
-					
-					if buf.offset == targetOffset {
-						r.current = buf
-						break
-					}
-					
-					// Wrong buffer, this shouldn't happen with ordered downloads
-					r.err = fmt.Errorf("received out-of-order buffer: wanted %d, got %d", targetOffset, buf.offset)
-					return totalRead, r.err
-					
-				case <-r.ctx.Done():
-					return totalRead, r.ctx.Err()
-				}
-			}
-		}
-		
-		// Copy from current buffer
-		bufferOffset := r.position - r.current.offset
-		available := int64(len(r.current.data)) - bufferOffset
-		toCopy := int64(len(p) - totalRead)
-		if toCopy > available {
-			toCopy = available
-		}
-		
-		copy(p[totalRead:], r.current.data[bufferOffset:bufferOffset+toCopy])
-		totalRead += int(toCopy)
-		r.position += toCopy
-	}
-	
-	return totalRead, nil
-}
-
-func (r *parallelDownloadReader) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	
-	if !r.closed {
-		r.closed = true
-		// Cancel context to stop any pending downloads
-		// Note: We don't have a cancel func here, so downloads will continue until complete
-	}
-	
-	return nil
+	return &azureFastReader{ReadCloser: stream, size: size}
 }

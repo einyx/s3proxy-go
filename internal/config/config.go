@@ -1,3 +1,4 @@
+// Package config provides configuration structures and loading functionality for the S3 proxy
 package config
 
 import (
@@ -8,13 +9,16 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Config represents the main configuration structure for the S3 proxy
 type Config struct {
-	Server  ServerConfig  `mapstructure:"server"`
-	S3      S3Config      `mapstructure:"s3"`
-	Storage StorageConfig `mapstructure:"storage"`
-	Auth    AuthConfig    `mapstructure:"auth"`
+	Server     ServerConfig     `mapstructure:"server"`
+	S3         S3Config         `mapstructure:"s3"`
+	Storage    StorageConfig    `mapstructure:"storage"`
+	Auth       AuthConfig       `mapstructure:"auth"`
+	Encryption EncryptionConfig `mapstructure:"encryption"`
 }
 
+// ServerConfig contains HTTP server configuration settings
 type ServerConfig struct {
 	Listen       string        `mapstructure:"listen" envconfig:"SERVER_LISTEN" default:":8080"`
 	ReadTimeout  time.Duration `mapstructure:"read_timeout" envconfig:"SERVER_READ_TIMEOUT" default:"60s"`
@@ -23,6 +27,7 @@ type ServerConfig struct {
 	MaxBodySize  int64         `mapstructure:"max_body_size" envconfig:"SERVER_MAX_BODY_SIZE" default:"5368709120"` // 5GB
 }
 
+// S3Config contains S3-specific configuration settings
 type S3Config struct {
 	Region               string `mapstructure:"region" envconfig:"S3_REGION" default:"us-east-1"`
 	VirtualHost          bool   `mapstructure:"virtual_host" envconfig:"S3_VIRTUAL_HOST" default:"false"`
@@ -31,6 +36,7 @@ type S3Config struct {
 	IgnoreUnknownHeaders bool   `mapstructure:"ignore_unknown_headers" envconfig:"S3_IGNORE_UNKNOWN_HEADERS" default:"true"`
 }
 
+// StorageConfig specifies the storage backend configuration
 type StorageConfig struct {
 	Provider   string              `mapstructure:"provider" envconfig:"STORAGE_PROVIDER" required:"true"`
 	Azure      *AzureStorageConfig `mapstructure:"azure"`
@@ -38,6 +44,7 @@ type StorageConfig struct {
 	FileSystem *FileSystemConfig   `mapstructure:"filesystem"`
 }
 
+// AzureStorageConfig contains Azure Blob Storage specific settings
 type AzureStorageConfig struct {
 	AccountName   string `mapstructure:"account_name" envconfig:"AZURE_ACCOUNT_NAME"`
 	AccountKey    string `mapstructure:"account_key" envconfig:"AZURE_ACCOUNT_KEY"`
@@ -47,20 +54,35 @@ type AzureStorageConfig struct {
 	SASToken      string `mapstructure:"sas_token" envconfig:"AZURE_SAS_TOKEN"`
 }
 
+// S3StorageConfig contains S3 storage backend specific settings
 type S3StorageConfig struct {
-	Endpoint     string `mapstructure:"endpoint" envconfig:"S3_ENDPOINT"`
-	Region       string `mapstructure:"region" envconfig:"S3_REGION" default:"us-east-1"`
-	AccessKey    string `mapstructure:"access_key" envconfig:"S3_ACCESS_KEY"`
-	SecretKey    string `mapstructure:"secret_key" envconfig:"S3_SECRET_KEY"`
-	Profile      string `mapstructure:"profile" envconfig:"AWS_PROFILE"`
-	UsePathStyle bool   `mapstructure:"use_path_style" envconfig:"S3_USE_PATH_STYLE" default:"true"`
-	DisableSSL   bool   `mapstructure:"disable_ssl" envconfig:"S3_DISABLE_SSL" default:"false"`
+	Endpoint      string                   `mapstructure:"endpoint" envconfig:"S3_ENDPOINT"`
+	Region        string                   `mapstructure:"region" envconfig:"S3_REGION" default:"us-east-1"`
+	AccessKey     string                   `mapstructure:"access_key" envconfig:"S3_ACCESS_KEY"`
+	SecretKey     string                   `mapstructure:"secret_key" envconfig:"S3_SECRET_KEY"`
+	Profile       string                   `mapstructure:"profile" envconfig:"AWS_PROFILE"`
+	UsePathStyle  bool                     `mapstructure:"use_path_style" envconfig:"S3_USE_PATH_STYLE" default:"true"`
+	DisableSSL    bool                     `mapstructure:"disable_ssl" envconfig:"S3_DISABLE_SSL" default:"false"`
+	BucketMapping map[string]string        `mapstructure:"bucket_mapping"` // Map virtual bucket names to real bucket names
+	BucketConfigs map[string]*BucketConfig `mapstructure:"bucket_configs"` // Per-bucket configuration
 }
 
+// BucketConfig contains per-bucket configuration settings
+type BucketConfig struct {
+	RealName  string `mapstructure:"real_name"`  // Real bucket name in S3
+	Prefix    string `mapstructure:"prefix"`     // Optional prefix (subdirectory) within the bucket
+	Region    string `mapstructure:"region"`     // AWS region for this bucket
+	Endpoint  string `mapstructure:"endpoint"`   // Optional custom endpoint for this bucket
+	AccessKey string `mapstructure:"access_key"` // Optional per-bucket access key
+	SecretKey string `mapstructure:"secret_key"` // Optional per-bucket secret key
+}
+
+// FileSystemConfig contains filesystem storage backend settings
 type FileSystemConfig struct {
 	BaseDir string `mapstructure:"base_dir" envconfig:"FS_BASE_DIR" default:"/data"`
 }
 
+// AuthConfig specifies authentication configuration
 type AuthConfig struct {
 	Type       string `mapstructure:"type" envconfig:"AUTH_TYPE" default:"none"` // none, basic, awsv2, awsv4
 	Identity   string `mapstructure:"identity" envconfig:"AUTH_IDENTITY"`
@@ -70,6 +92,37 @@ type AuthConfig struct {
 	AWSSecretAccessKey string `mapstructure:"-" envconfig:"AWS_SECRET_ACCESS_KEY"`
 }
 
+// EncryptionConfig specifies encryption settings
+type EncryptionConfig struct {
+	Enabled     bool               `mapstructure:"enabled" envconfig:"ENCRYPTION_ENABLED" default:"false"`
+	Algorithm   string             `mapstructure:"algorithm" envconfig:"ENCRYPTION_ALGORITHM" default:"AES-256-GCM"`
+	KeyProvider string             `mapstructure:"key_provider" envconfig:"ENCRYPTION_KEY_PROVIDER" default:"local"`
+	Local       *LocalKeyConfig    `mapstructure:"local"`
+	KMS         *KMSKeyConfig      `mapstructure:"kms"`
+	Policies    []EncryptionPolicy `mapstructure:"policies"`
+}
+
+// LocalKeyConfig contains settings for local key management
+type LocalKeyConfig struct {
+	MasterKey string `mapstructure:"master_key" envconfig:"ENCRYPTION_LOCAL_MASTER_KEY"`
+}
+
+// KMSKeyConfig contains settings for AWS KMS key management
+type KMSKeyConfig struct {
+	KeyID    string `mapstructure:"key_id" envconfig:"ENCRYPTION_KMS_KEY_ID"`
+	Region   string `mapstructure:"region" envconfig:"ENCRYPTION_KMS_REGION"`
+	CacheTTL int    `mapstructure:"cache_ttl" envconfig:"ENCRYPTION_KMS_CACHE_TTL" default:"300"`
+}
+
+// EncryptionPolicy defines bucket-specific encryption policies
+type EncryptionPolicy struct {
+	BucketPattern string `mapstructure:"bucket_pattern"`
+	Algorithm     string `mapstructure:"algorithm"`
+	KeyProvider   string `mapstructure:"key_provider"`
+	Mandatory     bool   `mapstructure:"mandatory"`
+}
+
+// Load reads and validates configuration from a file
 func Load(configFile string) (*Config, error) {
 	cfg := &Config{}
 
@@ -121,13 +174,16 @@ func validate(cfg *Config) error {
 		if cfg.Storage.S3 == nil {
 			return fmt.Errorf("s3 storage config is required")
 		}
-		// When using AWS profile, credentials are not required
-		if cfg.Storage.S3.Profile == "" && cfg.Storage.S3.AccessKey == "" && cfg.Storage.S3.SecretKey == "" {
-			// Check if AWS environment variables are set
-			if cfg.Auth.AWSAccessKeyID == "" || cfg.Auth.AWSSecretAccessKey == "" {
-				return fmt.Errorf("s3 credentials are required: specify profile, access/secret keys, or AWS environment variables")
+		// When using AWS profile or IAM roles, explicit credentials are not required
+		// Allow the SDK to use its credential chain (env vars, IAM role, etc.)
+		// Only validate if we're using a custom endpoint (MinIO, etc.)
+		if cfg.Storage.S3.Endpoint != "" {
+			// For custom endpoints, we need explicit credentials
+			if cfg.Storage.S3.Profile == "" && cfg.Storage.S3.AccessKey == "" && cfg.Storage.S3.SecretKey == "" {
+				return fmt.Errorf("s3 credentials are required for custom endpoint: specify profile or access/secret keys")
 			}
 		}
+		// For real AWS, credentials are optional - can use IAM roles
 	case "filesystem":
 		if cfg.Storage.FileSystem == nil {
 			return fmt.Errorf("filesystem storage config is required")

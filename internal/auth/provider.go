@@ -1,3 +1,4 @@
+// Package auth provides authentication providers for S3 proxy operations.
 package auth
 
 import (
@@ -217,6 +218,9 @@ func (p *AWSV4Provider) Authenticate(r *http.Request) error {
 	return nil
 }
 
+// getSigningKey generates AWS signature key - kept for future use
+//
+//nolint:unused
 func getSigningKey(key, dateStamp, regionName, serviceName string) []byte {
 	kDate := hmacSHA256([]byte("AWS4"+key), []byte(dateStamp))
 	kRegion := hmacSHA256(kDate, []byte(regionName))
@@ -225,13 +229,16 @@ func getSigningKey(key, dateStamp, regionName, serviceName string) []byte {
 	return kSigning
 }
 
+// hmacSHA256 computes HMAC-SHA256 - kept for future use
+//
+//nolint:unused
 func hmacSHA256(key, data []byte) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write(data)
 	return h.Sum(nil)
 }
 
-// FastAWSProvider implementation - optimized for speed
+// Authenticate validates AWS signature for incoming requests - optimized for speed.
 func (p *FastAWSProvider) Authenticate(r *http.Request) error {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
@@ -286,7 +293,7 @@ func (p *FastAWSProvider) Authenticate(r *http.Request) error {
 	return err
 }
 
-func (p *FastAWSProvider) authenticateV2Fast(r *http.Request, authHeader string) error {
+func (p *FastAWSProvider) authenticateV2Fast(_ *http.Request, authHeader string) error {
 	parts := strings.SplitN(authHeader[4:], ":", 2)
 	if len(parts) != 2 {
 		return fmt.Errorf("invalid authorization header format")
@@ -302,7 +309,7 @@ func (p *FastAWSProvider) authenticateV2Fast(r *http.Request, authHeader string)
 	return nil
 }
 
-func (p *FastAWSProvider) authenticateV4Fast(r *http.Request, authHeader string) error {
+func (p *FastAWSProvider) authenticateV4Fast(_ *http.Request, authHeader string) error {
 	// Parse authorization header
 	if !strings.Contains(authHeader, "Credential=") {
 		return fmt.Errorf("missing credential in authorization header")

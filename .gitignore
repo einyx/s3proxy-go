@@ -43,6 +43,7 @@ Thumbs.db
 *.env
 !.env.example
 !.env.sample
+!.env.template
 
 # Secrets and credentials
 **/secrets/
@@ -107,9 +108,30 @@ __debug_bin
 tmp/
 temp/
 
+# Test files
+.test-master-key
+test-*.go
+debug-*.go
+test-data/
+test-fs-encryption/
+debug-fs/
+
 # Pre-commit
 .pre-commit-config.yaml.bak
 
 # Security scanning
 gosec-report.json
 trufflehog-results.json
+
+# AWS credentials and config
+.aws/
+aws-config.yaml
+aws-*.yaml
+!aws-*-example.yaml
+
+# MinIO credentials
+minio-*.yaml
+!minio-*-example.yaml
+
+# Wiki (embedded git repo)
+wiki/

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -68,16 +69,16 @@ func BenchmarkS3ProxyGet(b *testing.B) {
 		b.Run(fmt.Sprintf("size_%dB", size), func(b *testing.B) {
 			// Create test object with random data
 			data := make([]byte, size)
-			rand.Read(data)
+			_, _ = rand.Read(data)
 
 			// Upload object once
-			req, _ := http.NewRequest("PUT", ts.URL+"/test-bucket/test-object", bytes.NewReader(data))
+			req, _ := http.NewRequestWithContext(context.Background(), "PUT", ts.URL+"/test-bucket/test-object", bytes.NewReader(data))
 			req.ContentLength = int64(size)
 			resp, err := client.Do(req)
 			if err != nil {
 				b.Fatal(err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			b.ResetTimer()
 			b.SetBytes(int64(size))
@@ -85,7 +86,7 @@ func BenchmarkS3ProxyGet(b *testing.B) {
 			// Benchmark GET requests with realistic parallelism
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					req, _ := http.NewRequest("GET", ts.URL+"/test-bucket/test-object", nil)
+					req, _ := http.NewRequestWithContext(context.Background(), "GET", ts.URL+"/test-bucket/test-object", nil)
 					resp, err := client.Do(req)
 					if err != nil {
 						b.Fatal(err)
@@ -99,7 +100,7 @@ func BenchmarkS3ProxyGet(b *testing.B) {
 					if written != int64(size) {
 						b.Fatalf("Expected %d bytes, got %d", size, written)
 					}
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 			})
 		})
@@ -135,8 +136,11 @@ func BenchmarkS3ProxyPut(b *testing.B) {
 	defer ts.Close()
 
 	// Create test bucket
-	req, _ := http.NewRequest("PUT", ts.URL+"/test-bucket", nil)
-	http.DefaultClient.Do(req)
+	req, _ := http.NewRequestWithContext(context.Background(), "PUT", ts.URL+"/test-bucket", nil)
+	resp, _ := http.DefaultClient.Do(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 
 	sizes := []int{
 		1024,             // 1KB
@@ -147,20 +151,22 @@ func BenchmarkS3ProxyPut(b *testing.B) {
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
 			data := make([]byte, size)
-			rand.Read(data)
+			_, _ = rand.Read(data)
 
 			b.ResetTimer()
 			b.SetBytes(int64(size))
 
 			// Benchmark PUT requests
 			for i := 0; i < b.N; i++ {
-				req, _ := http.NewRequest("PUT", ts.URL+fmt.Sprintf("/test-bucket/object-%d", i), bytes.NewReader(data))
+				req, _ := http.NewRequestWithContext(
+					context.Background(), "PUT", ts.URL+fmt.Sprintf("/test-bucket/object-%d", i), bytes.NewReader(data),
+				)
 				req.ContentLength = int64(size)
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
 					b.Fatal(err)
 				}
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 		})
 	}
@@ -245,17 +251,17 @@ func BenchmarkConcurrentRequests(b *testing.B) {
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("concurrent_size_%dB", size), func(b *testing.B) {
 			data := make([]byte, size)
-			rand.Read(data)
+			_, _ = rand.Read(data)
 
 			// Upload test object
-			req, _ := http.NewRequest("PUT", ts.URL+"/test-bucket/test-object", bytes.NewReader(data))
+			req, _ := http.NewRequestWithContext(context.Background(), "PUT", ts.URL+"/test-bucket/test-object", bytes.NewReader(data))
 			req.ContentLength = int64(size)
 			client := &http.Client{Timeout: 30 * time.Second}
 			resp, err := client.Do(req)
 			if err != nil {
 				b.Fatal(err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			b.ResetTimer()
 			b.SetBytes(int64(size))
@@ -275,7 +281,7 @@ func BenchmarkConcurrentRequests(b *testing.B) {
 				}
 
 				for pb.Next() {
-					req, _ := http.NewRequest("GET", ts.URL+"/test-bucket/test-object", nil)
+					req, _ := http.NewRequestWithContext(context.Background(), "GET", ts.URL+"/test-bucket/test-object", nil)
 					resp, err := client.Do(req)
 					if err != nil {
 						b.Fatal(err)
@@ -288,7 +294,7 @@ func BenchmarkConcurrentRequests(b *testing.B) {
 					if written != int64(size) {
 						b.Fatalf("Expected %d bytes, got %d", size, written)
 					}
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 			})
 		})
@@ -322,16 +328,16 @@ func BenchmarkRangeRequests(b *testing.B) {
 	// Create a large test object
 	size := 100 * 1024 * 1024 // 100MB
 	data := make([]byte, size)
-	rand.Read(data)
+	_, _ = rand.Read(data)
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	req, _ := http.NewRequest("PUT", ts.URL+"/test-bucket/large-object", bytes.NewReader(data))
+	req, _ := http.NewRequestWithContext(context.Background(), "PUT", ts.URL+"/test-bucket/large-object", bytes.NewReader(data))
 	req.ContentLength = int64(size)
 	resp, err := client.Do(req)
 	if err != nil {
 		b.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	b.ResetTimer()
 
@@ -352,7 +358,7 @@ func BenchmarkRangeRequests(b *testing.B) {
 					start := mathrand.Intn(size - rangeSize)
 					end := start + rangeSize - 1
 
-					req, _ := http.NewRequest("GET", ts.URL+"/test-bucket/large-object", nil)
+					req, _ := http.NewRequestWithContext(context.Background(), "GET", ts.URL+"/test-bucket/large-object", nil)
 					req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 					resp, err := client.Do(req)
@@ -371,7 +377,7 @@ func BenchmarkRangeRequests(b *testing.B) {
 					if written != int64(rangeSize) {
 						b.Fatalf("Expected %d bytes, got %d", rangeSize, written)
 					}
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 			})
 		})
@@ -405,28 +411,28 @@ func BenchmarkMetricsOverhead(b *testing.B) {
 	// Small object for minimal I/O overhead
 	size := 1024 // 1KB
 	data := make([]byte, size)
-	rand.Read(data)
+	_, _ = rand.Read(data)
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, _ := http.NewRequest("PUT", ts.URL+"/test-bucket/small-object", bytes.NewReader(data))
+	req, _ := http.NewRequestWithContext(context.Background(), "PUT", ts.URL+"/test-bucket/small-object", bytes.NewReader(data))
 	req.ContentLength = int64(size)
 	resp, err := client.Do(req)
 	if err != nil {
 		b.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	b.ResetTimer()
 	b.SetBytes(int64(size))
 
 	// Test pure request throughput to measure metrics overhead
 	for i := 0; i < b.N; i++ {
-		req, _ := http.NewRequest("GET", ts.URL+"/test-bucket/small-object", nil)
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", ts.URL+"/test-bucket/small-object", nil)
 		resp, err := client.Do(req)
 		if err != nil {
 			b.Fatal(err)
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 	}
 }

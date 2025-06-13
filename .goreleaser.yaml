@@ -51,6 +51,42 @@ checksum:
 snapshot:
   name_template: "{{ incpatch .Version }}-next"
 
+nfpms:
+  - id: s3proxy
+    package_name: s3proxy
+    vendor: S3Proxy
+    homepage: https://github.com/{{ .Env.GITHUB_REPOSITORY }}
+    maintainer: S3Proxy Team
+    description: High-performance S3-compatible proxy with encryption support
+    license: Apache 2.0
+    formats:
+      - deb
+      - rpm
+    dependencies:
+      - systemd
+    contents:
+      - src: s3proxy
+        dst: /usr/bin/s3proxy
+      - src: config-test.yaml
+        dst: /etc/s3proxy/config.yaml.example
+        type: config
+      - src: ./systemd/s3proxy.service
+        dst: /lib/systemd/system/s3proxy.service
+    scripts:
+      postinstall: ./scripts/postinstall.sh
+      preremove: ./scripts/preremove.sh
+
+nsis:
+  - id: s3proxy-installer
+    name: S3Proxy-{{ .Version }}-Windows-{{ .Arch }}-installer
+    homepage: https://github.com/{{ .Env.GITHUB_REPOSITORY }}
+    license: LICENSE
+    script: installer.nsi
+    include:
+      - LICENSE
+      - README.md
+      - config-test.yaml
+
 changelog:
   sort: asc
   filters:
@@ -83,6 +119,23 @@ release:
     High-performance S3-compatible proxy with support for multiple storage backends.
 
   footer: |
+    ## Installation
+
+    ### Windows
+    Download and run the Windows installer: `S3Proxy-{{ .Version }}-Windows-x86_64-installer.exe`
+
+    ### Linux (Debian/Ubuntu)
+    ```bash
+    dpkg -i s3proxy_{{ .Version }}_amd64.deb
+    systemctl start s3proxy
+    ```
+
+    ### Linux (RHEL/CentOS)
+    ```bash
+    rpm -i s3proxy_{{ .Version }}_amd64.rpm
+    systemctl start s3proxy
+    ```
+
     ## Docker Images
 
     ```bash

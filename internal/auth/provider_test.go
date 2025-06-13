@@ -57,8 +57,8 @@ func TestNewProvider(t *testing.T) {
 			name: "awsv2 auth type",
 			cfg: config.AuthConfig{
 				Type:       "awsv2",
-				Identity:   "AKIAIOSFODNN7EXAMPLE",
-				Credential: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+				Identity:   "AKIAEXAMPLEKEY",
+				Credential: "exampleSecretKey",
 			},
 			wantErr: false,
 		},
@@ -76,8 +76,8 @@ func TestNewProvider(t *testing.T) {
 			name: "awsv4 auth type",
 			cfg: config.AuthConfig{
 				Type:       "awsv4",
-				Identity:   "AKIAIOSFODNN7EXAMPLE",
-				Credential: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+				Identity:   "AKIAEXAMPLEKEY",
+				Credential: "exampleSecretKey",
 			},
 			wantErr: false,
 		},
@@ -278,7 +278,9 @@ func TestAWSV4Provider(t *testing.T) {
 			name: "valid v4 signature",
 			setupReq: func(req *http.Request) {
 				// AWS v4 signature format
-				req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20230101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abcd")
+				req.Header.Set("Authorization",
+					"AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20230101/us-east-1/s3/aws4_request, "+
+						"SignedHeaders=host;x-amz-date, Signature=abcd")
 				req.Header.Set("X-Amz-Date", "20230101T000000Z")
 			},
 			wantErr: false, // Simplified validation in test implementation

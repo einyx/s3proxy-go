@@ -1,3 +1,4 @@
+// Package cache provides high-performance caching for S3 objects
 package cache
 
 import (
@@ -7,9 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/einyx/s3proxy-go/internal/storage"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/sirupsen/logrus"
+
+	"github.com/einyx/s3proxy-go/internal/storage"
 )
 
 // ObjectCache provides high-performance caching for S3 objects
@@ -67,7 +69,7 @@ func NewObjectCache(maxMemory, maxObjectSize int64, ttl time.Duration) (*ObjectC
 }
 
 // GetObject retrieves an object from cache
-func (c *ObjectCache) GetObject(ctx context.Context, bucket, key string) (*storage.Object, bool) {
+func (c *ObjectCache) GetObject(_ context.Context, bucket, key string) (*storage.Object, bool) {
 	cacheKey := fmt.Sprintf("%s/%s", bucket, key)
 
 	// Try hot cache first
@@ -95,7 +97,7 @@ func (c *ObjectCache) GetObject(ctx context.Context, bucket, key string) (*stora
 }
 
 // PutObject adds an object to cache if it meets criteria
-func (c *ObjectCache) PutObject(ctx context.Context, bucket, key string, data []byte, info *storage.ObjectInfo) {
+func (c *ObjectCache) PutObject(_ context.Context, bucket, key string, data []byte, info *storage.ObjectInfo) {
 	// Only cache small objects
 	if int64(len(data)) > c.maxObjectSize {
 		return
@@ -115,7 +117,7 @@ func (c *ObjectCache) PutObject(ctx context.Context, bucket, key string, data []
 }
 
 // GetMetadata retrieves object metadata from cache
-func (c *ObjectCache) GetMetadata(ctx context.Context, bucket, key string) (*storage.ObjectInfo, bool) {
+func (c *ObjectCache) GetMetadata(_ context.Context, bucket, key string) (*storage.ObjectInfo, bool) {
 	cacheKey := fmt.Sprintf("%s/%s", bucket, key)
 
 	if info, ok := c.metaCache.Get(cacheKey); ok {
@@ -242,7 +244,7 @@ func (cb *CachingBackend) GetObject(ctx context.Context, bucket, key string) (*s
 	if obj.Size > 0 && obj.Size <= cb.cache.maxObjectSize {
 		data := make([]byte, obj.Size)
 		_, readErr := io.ReadFull(obj.Body, data)
-		obj.Body.Close()
+		_ = obj.Body.Close()
 
 		if readErr == nil {
 			// Cache the object
@@ -287,7 +289,9 @@ func (cb *CachingBackend) HeadObject(ctx context.Context, bucket, key string) (*
 }
 
 // PutObject stores an object and invalidates cache
-func (cb *CachingBackend) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, metadata map[string]string) error {
+func (cb *CachingBackend) PutObject(
+	ctx context.Context, bucket, key string, reader io.Reader, size int64, metadata map[string]string,
+) error {
 	err := cb.Backend.PutObject(ctx, bucket, key, reader, size, metadata)
 	if err != nil {
 		return err

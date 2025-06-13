@@ -48,7 +48,11 @@ func TestNewFileSystemBackend(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to create temp dir: %v", err)
 				}
-				defer os.RemoveAll(tempDir)
+				defer func() {
+					if err := os.RemoveAll(tempDir); err != nil {
+						t.Logf("Failed to clean up temp dir: %v", err)
+					}
+				}()
 				tt.cfg.BaseDir = tempDir
 			}
 
@@ -69,256 +73,337 @@ func TestNewFileSystemBackend(t *testing.T) {
 	}
 }
 
-func TestFileSystemBackend_Operations(t *testing.T) {
-	ctx := context.Background()
-
-	// Create temporary directory for tests
+// setupFileSystemBackend creates a temporary filesystem backend for testing
+func setupFileSystemBackend(t *testing.T) (*FileSystemBackend, string) {
 	tempDir, err := os.MkdirTemp("", "s3proxy-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
 
 	backend, err := NewFileSystemBackend(&config.FileSystemConfig{
 		BaseDir: tempDir,
 	})
 	if err != nil {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
+		}
 		t.Fatalf("Failed to create filesystem backend: %v", err)
 	}
 
-	t.Run("CreateBucket and BucketExists", func(t *testing.T) {
-		bucket := "test-bucket"
+	return backend, tempDir
+}
 
-		// Create bucket
-		err := backend.CreateBucket(ctx, bucket)
-		if err != nil {
-			t.Fatalf("CreateBucket() error = %v", err)
+func TestFileSystemBackend_CreateAndCheckBucket(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
 		}
+	}()
 
-		// Check exists
-		exists, err := backend.BucketExists(ctx, bucket)
-		if err != nil {
-			t.Fatalf("BucketExists() error = %v", err)
+	ctx := context.Background()
+	bucket := "test-bucket"
+
+	// Create bucket
+	err := backend.CreateBucket(ctx, bucket)
+	if err != nil {
+		t.Fatalf("CreateBucket() error = %v", err)
+	}
+
+	// Check exists
+	exists, err := backend.BucketExists(ctx, bucket)
+	if err != nil {
+		t.Fatalf("BucketExists() error = %v", err)
+	}
+	if !exists {
+		t.Error("BucketExists() = false, want true")
+	}
+}
+
+func TestFileSystemBackend_ListBuckets(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
 		}
-		if !exists {
-			t.Error("BucketExists() = false, want true")
+	}()
+
+	ctx := context.Background()
+
+	// Create a few buckets
+	buckets := []string{"bucket1", "bucket2", "bucket3"}
+	for _, b := range buckets {
+		if err := backend.CreateBucket(ctx, b); err != nil {
+			t.Fatalf("CreateBucket(%s) error = %v", b, err)
 		}
-	})
+	}
 
-	t.Run("ListBuckets", func(t *testing.T) {
-		// Create a few buckets
-		buckets := []string{"bucket1", "bucket2", "bucket3"}
-		for _, b := range buckets {
-			if err := backend.CreateBucket(ctx, b); err != nil {
-				t.Fatalf("CreateBucket(%s) error = %v", b, err)
-			}
+	// List buckets
+	result, err := backend.ListBuckets(ctx)
+	if err != nil {
+		t.Fatalf("ListBuckets() error = %v", err)
+	}
+
+	// Should have at least the buckets we created
+	if len(result) < len(buckets) {
+		t.Errorf("ListBuckets() returned %d buckets, want at least %d", len(result), len(buckets))
+	}
+}
+
+func TestFileSystemBackend_PutAndGetObject(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
 		}
+	}()
 
-		// List buckets
-		result, err := backend.ListBuckets(ctx)
-		if err != nil {
-			t.Fatalf("ListBuckets() error = %v", err)
+	ctx := context.Background()
+	bucket := "put-get-bucket"
+	key := "test-key.txt"
+	content := []byte("test content")
+
+	// Create bucket
+	if err := backend.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
+
+	// Put object
+	err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+
+	// Get object
+	obj, err := backend.GetObject(ctx, bucket, key)
+	if err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	}
+	defer func() {
+		if closeErr := obj.Body.Close(); closeErr != nil {
+			t.Logf("Failed to close body: %v", closeErr)
 		}
+	}()
 
-		// Should have at least the buckets we created
-		if len(result) < len(buckets) {
-			t.Errorf("ListBuckets() returned %d buckets, want at least %d", len(result), len(buckets))
+	if obj.Size != int64(len(content)) {
+		t.Errorf("GetObject() size = %v, want %v", obj.Size, len(content))
+	}
+
+	data, err := io.ReadAll(obj.Body)
+	if err != nil {
+		t.Fatalf("Failed to read object: %v", err)
+	}
+
+	if !bytes.Equal(data, content) {
+		t.Errorf("GetObject() content = %v, want %v", data, content)
+	}
+}
+
+func TestFileSystemBackend_DeleteObject(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
 		}
-	})
+	}()
 
-	t.Run("PutObject and GetObject", func(t *testing.T) {
-		bucket := "put-get-bucket"
-		key := "test-key.txt"
-		content := []byte("test content")
+	ctx := context.Background()
+	bucket := "delete-bucket"
+	key := "delete-test.txt"
+	content := []byte("delete me")
 
-		// Create bucket
-		backend.CreateBucket(ctx, bucket)
+	// Create bucket
+	if err := backend.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
 
-		// Put object
+	// Put object
+	err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+
+	// Delete object
+	err = backend.DeleteObject(ctx, bucket, key)
+	if err != nil {
+		t.Fatalf("DeleteObject() error = %v", err)
+	}
+
+	// Verify deleted
+	_, err = backend.GetObject(ctx, bucket, key)
+	if err == nil {
+		t.Error("GetObject() expected error after delete")
+	}
+}
+
+func TestFileSystemBackend_HeadObject(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
+		}
+	}()
+
+	ctx := context.Background()
+	bucket := "head-bucket"
+	key := "head-test.txt"
+	content := []byte("head test content")
+
+	// Create bucket
+	if err := backend.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
+
+	// Put object
+	err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+
+	// Head object
+	info, err := backend.HeadObject(ctx, bucket, key)
+	if err != nil {
+		t.Fatalf("HeadObject() error = %v", err)
+	}
+
+	if info.Size != int64(len(content)) {
+		t.Errorf("HeadObject() size = %v, want %v", info.Size, len(content))
+	}
+
+	if info.Key != key {
+		t.Errorf("HeadObject() key = %v, want %v", info.Key, key)
+	}
+}
+
+func TestFileSystemBackend_ListObjects(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
+		}
+	}()
+
+	ctx := context.Background()
+	bucket := "list-bucket"
+
+	// Create bucket
+	if err := backend.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
+
+	// Put multiple objects
+	objects := []string{
+		"dir1/file1.txt",
+		"dir1/file2.txt",
+		"dir2/file3.txt",
+		"file4.txt",
+	}
+
+	for _, key := range objects {
+		content := []byte("content for " + key)
 		err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
 		if err != nil {
 			t.Fatalf("PutObject() error = %v", err)
 		}
+	}
 
-		// Get object
-		obj, err := backend.GetObject(ctx, bucket, key)
-		if err != nil {
-			t.Fatalf("GetObject() error = %v", err)
+	// List all objects (note: ListObjects uses delimiter by default)
+	result, err := backend.ListObjects(ctx, bucket, "", "", 1000)
+	if err != nil {
+		t.Fatalf("ListObjects() error = %v", err)
+	}
+
+	// Since ListObjects uses delimiter by default, we expect only root-level objects
+	// which is just "file4.txt"
+	if len(result.Contents) != 1 {
+		t.Errorf("ListObjects() objects = %v, want 1", len(result.Contents))
+	}
+
+	// Should have 2 common prefixes (dir1/ and dir2/)
+	if len(result.CommonPrefixes) != 2 {
+		t.Errorf("ListObjects() prefixes = %v, want 2", len(result.CommonPrefixes))
+	}
+}
+
+func TestFileSystemBackend_ListObjectsWithDelimiter(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
 		}
-		defer obj.Body.Close()
+	}()
 
-		if obj.Size != int64(len(content)) {
-			t.Errorf("GetObject() size = %v, want %v", obj.Size, len(content))
-		}
+	ctx := context.Background()
+	bucket := "list-delim-bucket"
 
-		data, err := io.ReadAll(obj.Body)
-		if err != nil {
-			t.Fatalf("Failed to read object: %v", err)
-		}
+	// Create bucket
+	if err := backend.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
 
-		if !bytes.Equal(data, content) {
-			t.Errorf("GetObject() content = %v, want %v", data, content)
-		}
-	})
+	// Put objects
+	objects := []string{
+		"dir1/file1.txt",
+		"dir1/file2.txt",
+		"dir2/file3.txt",
+		"file4.txt",
+	}
 
-	t.Run("DeleteObject", func(t *testing.T) {
-		bucket := "delete-bucket"
-		key := "delete-test.txt"
-		content := []byte("delete me")
-
-		// Create bucket
-		backend.CreateBucket(ctx, bucket)
-
-		// Put object
+	for _, key := range objects {
+		content := []byte("content")
 		err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
 		if err != nil {
 			t.Fatalf("PutObject() error = %v", err)
 		}
+	}
 
-		// Delete object
-		err = backend.DeleteObject(ctx, bucket, key)
-		if err != nil {
-			t.Fatalf("DeleteObject() error = %v", err)
+	// List with delimiter
+	result, err := backend.ListObjectsWithDelimiter(ctx, bucket, "", "", "/", 1000)
+	if err != nil {
+		t.Fatalf("ListObjectsWithDelimiter() error = %v", err)
+	}
+
+	// Should have 1 object at root and 2 prefixes
+	if len(result.Contents) != 1 {
+		t.Errorf("ListObjectsWithDelimiter() objects = %v, want 1", len(result.Contents))
+	}
+
+	if len(result.CommonPrefixes) != 2 {
+		t.Errorf("ListObjectsWithDelimiter() prefixes = %v, want 2", len(result.CommonPrefixes))
+	}
+}
+
+func TestFileSystemBackend_DeleteBucket(t *testing.T) {
+	backend, tempDir := setupFileSystemBackend(t)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
 		}
+	}()
 
-		// Verify deleted
-		_, err = backend.GetObject(ctx, bucket, key)
-		if err == nil {
-			t.Error("GetObject() expected error after delete")
-		}
-	})
+	ctx := context.Background()
+	bucket := "delete-bucket-test"
 
-	t.Run("HeadObject", func(t *testing.T) {
-		bucket := "head-bucket"
-		key := "head-test.txt"
-		content := []byte("head test content")
+	// Create bucket
+	err := backend.CreateBucket(ctx, bucket)
+	if err != nil {
+		t.Fatalf("CreateBucket() error = %v", err)
+	}
 
-		// Create bucket
-		backend.CreateBucket(ctx, bucket)
+	// Delete bucket
+	err = backend.DeleteBucket(ctx, bucket)
+	if err != nil {
+		t.Fatalf("DeleteBucket() error = %v", err)
+	}
 
-		// Put object
-		err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
-		if err != nil {
-			t.Fatalf("PutObject() error = %v", err)
-		}
-
-		// Head object
-		info, err := backend.HeadObject(ctx, bucket, key)
-		if err != nil {
-			t.Fatalf("HeadObject() error = %v", err)
-		}
-
-		if info.Size != int64(len(content)) {
-			t.Errorf("HeadObject() size = %v, want %v", info.Size, len(content))
-		}
-
-		if info.Key != key {
-			t.Errorf("HeadObject() key = %v, want %v", info.Key, key)
-		}
-	})
-
-	t.Run("ListObjects", func(t *testing.T) {
-		bucket := "list-bucket"
-
-		// Create bucket
-		backend.CreateBucket(ctx, bucket)
-
-		// Put multiple objects
-		objects := []string{
-			"dir1/file1.txt",
-			"dir1/file2.txt",
-			"dir2/file3.txt",
-			"file4.txt",
-		}
-
-		for _, key := range objects {
-			content := []byte("content for " + key)
-			err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
-			if err != nil {
-				t.Fatalf("PutObject() error = %v", err)
-			}
-		}
-
-		// List all objects (note: ListObjects uses delimiter by default)
-		result, err := backend.ListObjects(ctx, bucket, "", "", 1000)
-		if err != nil {
-			t.Fatalf("ListObjects() error = %v", err)
-		}
-
-		// Since ListObjects uses delimiter by default, we expect only root-level objects
-		// which is just "file4.txt"
-		if len(result.Contents) != 1 {
-			t.Errorf("ListObjects() objects = %v, want 1", len(result.Contents))
-		}
-
-		// Should have 2 common prefixes (dir1/ and dir2/)
-		if len(result.CommonPrefixes) != 2 {
-			t.Errorf("ListObjects() prefixes = %v, want 2", len(result.CommonPrefixes))
-		}
-	})
-
-	t.Run("ListObjectsWithDelimiter", func(t *testing.T) {
-		bucket := "list-delim-bucket"
-
-		// Create bucket
-		backend.CreateBucket(ctx, bucket)
-
-		// Put objects
-		objects := []string{
-			"dir1/file1.txt",
-			"dir1/file2.txt",
-			"dir2/file3.txt",
-			"file4.txt",
-		}
-
-		for _, key := range objects {
-			content := []byte("content")
-			err := backend.PutObject(ctx, bucket, key, bytes.NewReader(content), int64(len(content)), nil)
-			if err != nil {
-				t.Fatalf("PutObject() error = %v", err)
-			}
-		}
-
-		// List with delimiter
-		result, err := backend.ListObjectsWithDelimiter(ctx, bucket, "", "", "/", 1000)
-		if err != nil {
-			t.Fatalf("ListObjectsWithDelimiter() error = %v", err)
-		}
-
-		// Should have 1 object at root and 2 prefixes
-		if len(result.Contents) != 1 {
-			t.Errorf("ListObjectsWithDelimiter() objects = %v, want 1", len(result.Contents))
-		}
-
-		if len(result.CommonPrefixes) != 2 {
-			t.Errorf("ListObjectsWithDelimiter() prefixes = %v, want 2", len(result.CommonPrefixes))
-		}
-	})
-
-	t.Run("DeleteBucket", func(t *testing.T) {
-		bucket := "delete-bucket-test"
-
-		// Create bucket
-		err := backend.CreateBucket(ctx, bucket)
-		if err != nil {
-			t.Fatalf("CreateBucket() error = %v", err)
-		}
-
-		// Delete bucket
-		err = backend.DeleteBucket(ctx, bucket)
-		if err != nil {
-			t.Fatalf("DeleteBucket() error = %v", err)
-		}
-
-		// Verify deleted
-		exists, err := backend.BucketExists(ctx, bucket)
-		if err != nil {
-			t.Fatalf("BucketExists() error = %v", err)
-		}
-		if exists {
-			t.Error("BucketExists() = true after delete")
-		}
-	})
+	// Verify deleted
+	exists, err := backend.BucketExists(ctx, bucket)
+	if err != nil {
+		t.Fatalf("BucketExists() error = %v", err)
+	}
+	if exists {
+		t.Error("BucketExists() = true after delete")
+	}
 }
 
 func TestFileSystemBackend_Multipart(t *testing.T) {
@@ -328,7 +413,11 @@ func TestFileSystemBackend_Multipart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if cleanErr := os.RemoveAll(tempDir); cleanErr != nil {
+			t.Logf("Failed to clean up temp dir: %v", cleanErr)
+		}
+	}()
 
 	backend, err := NewFileSystemBackend(&config.FileSystemConfig{
 		BaseDir: tempDir,
@@ -341,7 +430,9 @@ func TestFileSystemBackend_Multipart(t *testing.T) {
 	key := "multipart.txt"
 
 	// Create bucket
-	backend.CreateBucket(ctx, bucket)
+	if err := backend.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
 
 	t.Run("InitiateMultipartUpload", func(t *testing.T) {
 		uploadID, err := backend.InitiateMultipartUpload(ctx, bucket, key, nil)
@@ -354,7 +445,9 @@ func TestFileSystemBackend_Multipart(t *testing.T) {
 		}
 
 		// Abort for cleanup
-		backend.AbortMultipartUpload(ctx, bucket, key, uploadID)
+		if err := backend.AbortMultipartUpload(ctx, bucket, key, uploadID); err != nil {
+			t.Logf("Failed to abort multipart upload: %v", err)
+		}
 	})
 
 	t.Run("Complete multipart upload flow", func(t *testing.T) {
@@ -394,7 +487,11 @@ func TestFileSystemBackend_Multipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetObject() after multipart error = %v", err)
 		}
-		defer obj.Body.Close()
+		defer func() {
+			if closeErr := obj.Body.Close(); closeErr != nil {
+				t.Logf("Failed to close body: %v", closeErr)
+			}
+		}()
 
 		data, _ := io.ReadAll(obj.Body)
 		expected := append(part1, part2...)

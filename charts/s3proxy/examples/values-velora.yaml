@@ -1,0 +1,81 @@
+# S3 Proxy Helm Values for Velora Namespace
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/einyx/s3proxy-go
+  tag: latest
+  pullPolicy: Always
+
+service:
+  name: minio
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+persistence:
+  enabled: false
+
+config:
+  server:
+    listen: ":8080"
+    readTimeout: "60s"
+    writeTimeout: "60s"
+    idleTimeout: "120s"
+    maxBodySize: "5368709120"
+  s3:
+    region: us-east-1
+    virtualHost: false
+    pathStyle: true
+    ignoreUnknownHeaders: true
+  storage:
+    provider: azure
+    azure:
+      accountName: owaintest1
+      containerName: benchmark-test
+      useSAS: false
+      accountKey: "${AZURE_STORAGE_KEY}"
+  auth:
+    type: awsv4
+    identity: minio
+    credential: minio123
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5

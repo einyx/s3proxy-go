@@ -42,7 +42,7 @@ func NewStreamReader(ctx context.Context, reader io.ReadCloser, chunkSize, prefe
 func (sr *StreamReader) prefetch() {
 	defer sr.wg.Done()
 	defer close(sr.buffer)
-	defer sr.reader.Close()
+	defer func() { _ = sr.reader.Close() }()
 
 	for {
 		select {
@@ -65,19 +65,19 @@ func (sr *StreamReader) prefetch() {
 					select {
 					case sr.buffer <- buf[:n]:
 					case <-sr.ctx.Done():
-						sr.bufferPool.Put(buf)
+						sr.bufferPool.Put(&buf)
 						sr.err.Store(sr.ctx.Err())
 						return
 					case <-sr.done:
-						sr.bufferPool.Put(buf)
+						sr.bufferPool.Put(&buf)
 						return
 					}
 				} else {
-					sr.bufferPool.Put(buf)
+					sr.bufferPool.Put(&buf)
 				}
 				return
 			} else if err != nil {
-				sr.bufferPool.Put(buf)
+				sr.bufferPool.Put(&buf)
 				sr.err.Store(err)
 				return
 			}
@@ -86,11 +86,11 @@ func (sr *StreamReader) prefetch() {
 			select {
 			case sr.buffer <- buf[:n]:
 			case <-sr.ctx.Done():
-				sr.bufferPool.Put(buf)
+				sr.bufferPool.Put(&buf)
 				sr.err.Store(sr.ctx.Err())
 				return
 			case <-sr.done:
-				sr.bufferPool.Put(buf)
+				sr.bufferPool.Put(&buf)
 				return
 			}
 		}
@@ -138,7 +138,7 @@ func (sr *StreamReader) Read(p []byte) (n int, err error) {
 			}
 
 			// Return buffer to pool
-			sr.bufferPool.Put(chunk)
+			sr.bufferPool.Put(&chunk)
 
 		case <-sr.ctx.Done():
 			return totalRead, sr.ctx.Err()
@@ -206,7 +206,7 @@ func (pw *ParallelWriter) worker() {
 			}
 		}
 		// Return buffer to pool
-		pw.bufferPool.Put(req.data)
+		pw.bufferPool.Put(&req.data)
 	}
 }
 
@@ -238,10 +238,10 @@ func (pw *ParallelWriter) Write(p []byte) (n int, err error) {
 	case pw.writeChan <- &writeRequest{data: data, offset: offset}:
 		return len(p), nil
 	case <-pw.ctx.Done():
-		pw.bufferPool.Put(data)
+		pw.bufferPool.Put(&data)
 		return 0, pw.ctx.Err()
 	case err := <-pw.errChan:
-		pw.bufferPool.Put(data)
+		pw.bufferPool.Put(&data)
 		return 0, err
 	}
 }

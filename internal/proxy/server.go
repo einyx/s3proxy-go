@@ -1,24 +1,23 @@
 package proxy
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
 
 	"github.com/einyx/s3proxy-go/internal/auth"
 	"github.com/einyx/s3proxy-go/internal/cache"
 	"github.com/einyx/s3proxy-go/internal/config"
 	"github.com/einyx/s3proxy-go/internal/storage"
 	"github.com/einyx/s3proxy-go/pkg/s3"
-	"github.com/gorilla/mux"
-	"github.com/sirupsen/logrus"
 )
 
+// Server handles S3 proxy requests
 type Server struct {
 	config    *config.Config
 	storage   storage.Backend
@@ -28,6 +27,7 @@ type Server struct {
 	// Removed limiters
 }
 
+// NewServer creates a new proxy server instance
 func NewServer(cfg *config.Config) (*Server, error) {
 	storageBackend, err := storage.NewBackend(cfg.Storage)
 	if err != nil {
@@ -38,28 +38,28 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	if cacheEnabled := os.Getenv("ENABLE_OBJECT_CACHE"); cacheEnabled == "true" {
 		maxMemory := int64(1024 * 1024 * 1024) // 1GB default
 		if envMem := os.Getenv("CACHE_MAX_MEMORY"); envMem != "" {
-			if parsed, err := strconv.ParseInt(envMem, 10, 64); err == nil {
+			if parsed, parseErr := strconv.ParseInt(envMem, 10, 64); parseErr == nil {
 				maxMemory = parsed
 			}
 		}
 
 		maxObjectSize := int64(10 * 1024 * 1024) // 10MB default
 		if envSize := os.Getenv("CACHE_MAX_OBJECT_SIZE"); envSize != "" {
-			if parsed, err := strconv.ParseInt(envSize, 10, 64); err == nil {
+			if parsed, parseErr := strconv.ParseInt(envSize, 10, 64); parseErr == nil {
 				maxObjectSize = parsed
 			}
 		}
 
 		ttl := 5 * time.Minute // 5 minutes default
 		if envTTL := os.Getenv("CACHE_TTL"); envTTL != "" {
-			if parsed, err := time.ParseDuration(envTTL); err == nil {
+			if parsed, parseErr := time.ParseDuration(envTTL); parseErr == nil {
 				ttl = parsed
 			}
 		}
 
-		objectCache, err := cache.NewObjectCache(maxMemory, maxObjectSize, ttl)
-		if err != nil {
-			logrus.WithError(err).Warn("Failed to create object cache, continuing without cache")
+		objectCache, cacheErr := cache.NewObjectCache(maxMemory, maxObjectSize, ttl)
+		if cacheErr != nil {
+			logrus.WithError(cacheErr).Warn("Failed to create object cache, continuing without cache")
 		} else {
 			logrus.WithFields(logrus.Fields{
 				"maxMemory":     maxMemory,
@@ -105,7 +105,8 @@ func (s *Server) setupRoutes() {
 	// IMPORTANT: Use a custom handler that applies auth per-request
 	s.router.PathPrefix("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Double-check: Skip auth for health endpoint
-		if r.URL.Path == "/health" {
+		const healthPath = "/health"
+		if r.URL.Path == healthPath {
 			s.healthCheck(w, r)
 			return
 		}
@@ -114,7 +115,7 @@ func (s *Server) setupRoutes() {
 		if s.config.Auth.Type != "none" {
 			if err := s.auth.Authenticate(r); err != nil {
 				w.WriteHeader(http.StatusForbidden)
-				w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
+				_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
 				return
 			}
 		}
@@ -124,23 +125,21 @@ func (s *Server) setupRoutes() {
 	})
 }
 
-func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
+func (s *Server) healthCheck(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"healthy"}`))
+	_, _ = w.Write([]byte(`{"status":"healthy"}`))
 }
 
+// loggingMiddleware is currently unused but kept for future use
+//
+//nolint:unused
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Fast path: skip logging for health checks
 		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
-		}
-
-		// Filter out unknown headers if configured
-		if s.config.S3.IgnoreUnknownHeaders {
-			s.filterUnknownHeaders(r)
 		}
 
 		// Only log in debug mode for performance
@@ -152,10 +151,9 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			})
 			logger.Debug("Request received")
 
-			wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-			next.ServeHTTP(wrapped, r)
+			next.ServeHTTP(w, r)
 
-			logger.WithField("status", wrapped.statusCode).Info("Request completed")
+			logger.Info("Request completed")
 		} else {
 			next.ServeHTTP(w, r)
 		}
@@ -163,7 +161,8 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 }
 
 // authMiddleware is no longer used - auth is handled inline in setupRoutes
-// Kept for reference only
+//
+//nolint:unused
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip auth for health check
@@ -181,7 +180,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		// Check for authorization
 		if err := s.auth.Authenticate(r); err != nil {
 			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
+			_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code></Error>`))
 			return
 		}
 
@@ -189,6 +188,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// corsMiddleware is currently unused but kept for future use
+//
+//nolint:unused
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -203,118 +205,4 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
-}
-
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-func (s *Server) filterUnknownHeaders(r *http.Request) {
-	// List of known S3 headers that should be allowed
-	knownHeaders := map[string]bool{
-		"authorization":                   true,
-		"content-type":                    true,
-		"content-length":                  true,
-		"content-md5":                     true,
-		"date":                            true,
-		"host":                            true,
-		"user-agent":                      true,
-		"x-amz-acl":                       true,
-		"x-amz-content-sha256":            true,
-		"x-amz-date":                      true,
-		"x-amz-security-token":            true,
-		"x-amz-user-agent":                true,
-		"x-amz-storage-class":             true,
-		"x-amz-website-redirect-location": true,
-		"x-amz-server-side-encryption":    true,
-		"x-amz-server-side-encryption-aws-kms-key-id":     true,
-		"x-amz-server-side-encryption-context":            true,
-		"x-amz-server-side-encryption-customer-algorithm": true,
-		"x-amz-server-side-encryption-customer-key":       true,
-		"x-amz-server-side-encryption-customer-key-md5":   true,
-		"x-amz-copy-source":                               true,
-		"x-amz-copy-source-if-match":                      true,
-		"x-amz-copy-source-if-none-match":                 true,
-		"x-amz-copy-source-if-unmodified-since":           true,
-		"x-amz-copy-source-if-modified-since":             true,
-		"x-amz-metadata-directive":                        true,
-		"x-amz-tagging":                                   true,
-		"x-amz-tagging-directive":                         true,
-		"cache-control":                                   true,
-		"content-disposition":                             true,
-		"content-encoding":                                true,
-		"content-language":                                true,
-		"expires":                                         true,
-		"range":                                           true,
-		"if-match":                                        true,
-		"if-none-match":                                   true,
-		"if-unmodified-since":                             true,
-		"if-modified-since":                               true,
-	}
-
-	// Remove unknown headers
-	for key := range r.Header {
-		lowerKey := strings.ToLower(key)
-
-		// Allow all x-amz-meta-* headers
-		if strings.HasPrefix(lowerKey, "x-amz-meta-") {
-			continue
-		}
-
-		// Allow all x-amz-checksum-* headers (including x-amz-checksum-crc64nvme)
-		if strings.HasPrefix(lowerKey, "x-amz-checksum-") {
-			continue
-		}
-
-		// Check if it's a known header
-		if !knownHeaders[lowerKey] {
-			logrus.WithField("header", key).Debug("Removing unknown header")
-			delete(r.Header, key)
-		}
-	}
-}
-
-// preWarmMiddleware pre-allocates and warms connections for optimal PUT performance
-func (s *Server) preWarmMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// ULTRA PUT OPTIMIZATION: Pre-warm connection for 1MB PUTs
-		if r.Method == "PUT" && r.ContentLength == 1024*1024 {
-			// CONNECTION OPTIMIZATION: Set optimal TCP options immediately
-			if hijacker, ok := w.(http.Hijacker); ok {
-				if conn, _, err := hijacker.Hijack(); err == nil {
-					// Connection already optimized via transport layer
-					// Just return it to pool
-					conn.Close()
-				}
-			}
-
-			// BUFFER PRE-ALLOCATION: Hint to Go runtime about incoming data
-			if r.Body != nil {
-				// Pre-read a tiny amount to trigger TCP optimizations
-				buf := make([]byte, 1)
-				n, _ := r.Body.Read(buf)
-				if n > 0 {
-					// Put it back using a custom ReadCloser
-					r.Body = &preReadBody{
-						Reader: io.MultiReader(bytes.NewReader(buf[:n]), r.Body),
-						Closer: r.Body,
-					}
-				}
-			}
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// preReadBody wraps an io.Reader to make it an io.ReadCloser
-type preReadBody struct {
-	io.Reader
-	io.Closer
 }

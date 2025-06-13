@@ -207,6 +207,7 @@ S3_ENDPOINT=https://s3.amazonaws.com   # S3 endpoint URL
 S3_REGION=us-east-1                   # AWS region
 S3_ACCESS_KEY=your-access-key         # AWS access key
 S3_SECRET_KEY=your-secret-key         # AWS secret key
+AWS_PROFILE=dev                       # AWS profile name (supports SSO)
 S3_USE_PATH_STYLE=false               # Use path-style URLs
 S3_DISABLE_SSL=false                  # Disable SSL
 
@@ -266,6 +267,7 @@ storage:
     region: "us-east-1"
     access_key: "your-access-key"
     secret_key: "your-secret-key"
+    profile: "dev"  # AWS profile name (supports SSO)
     use_path_style: false
     disable_ssl: false
 
@@ -298,6 +300,26 @@ logging:
 ```
 
 ## 🔧 Usage Examples
+
+### Using AWS Profile (with SSO support)
+
+```bash
+# Run s3proxy with AWS profile
+STORAGE_PROVIDER=s3 AWS_PROFILE=dev ./bin/s3proxy
+
+# Or using config file
+cat > config.yaml <<EOF
+storage:
+  provider: s3
+  s3:
+    profile: "dev"
+    region: "us-east-1"
+auth:
+  type: none  # or awsv4 for authenticated access
+EOF
+
+./bin/s3proxy -c config.yaml
+```
 
 ### AWS CLI
 
