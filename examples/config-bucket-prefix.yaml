@@ -1,0 +1,70 @@
+# Example configuration showing bucket prefix mapping
+# This allows mapping virtual buckets to subdirectories within real S3 buckets
+
+server:
+  listen: ":8080"
+  log_level: "info"
+
+s3:
+  region: us-east-1
+  path_style: false
+
+storage:
+  provider: s3
+  s3:
+    region: us-east-1
+    # Use AWS IAM role or environment variables
+
+    # Advanced bucket configurations with prefix mapping
+    bucket_configs:
+      # Map "dev-data" virtual bucket to a subdirectory in shared bucket
+      dev-data:
+        real_name: company-shared-bucket
+        prefix: environments/dev/data
+        region: us-east-1
+
+      # Map "staging-data" to another subdirectory
+      staging-data:
+        real_name: company-shared-bucket
+        prefix: environments/staging/data
+        region: us-east-1
+
+      # Map "prod-data" to its own bucket (no prefix)
+      prod-data:
+        real_name: company-prod-bucket
+        region: us-east-1
+
+      # Map "team-alice" to a team-specific directory
+      team-alice:
+        real_name: company-shared-bucket
+        prefix: teams/alice
+        region: us-east-1
+
+      # Map "team-bob" to a team-specific directory
+      team-bob:
+        real_name: company-shared-bucket
+        prefix: teams/bob
+        region: us-east-1
+
+      # Map "archives" to a different region with prefix
+      archives:
+        real_name: company-archive-bucket
+        prefix: 2024/data
+        region: us-west-2
+
+      # Map "analytics" to a cross-account bucket with specific credentials
+      analytics:
+        real_name: analytics-dept-bucket
+        prefix: external/company-data
+        region: eu-west-1
+        access_key: ${ANALYTICS_ACCESS_KEY}
+        secret_key: ${ANALYTICS_SECRET_KEY}
+
+auth:
+  type: awsv4
+
+# With this configuration:
+# - Client writes to "dev-data/file.txt" → stored as "environments/dev/data/file.txt" in company-shared-bucket
+# - Client writes to "team-alice/report.pdf" → stored as "teams/alice/report.pdf" in company-shared-bucket
+# - Client writes to "prod-data/config.json" → stored as "config.json" in company-prod-bucket (no prefix)
+# - Client lists "dev-data/" → only sees objects under "environments/dev/data/" prefix

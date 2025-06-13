@@ -1,0 +1,46 @@
+server:
+  listen: ":8080"
+  read_timeout: 60s
+  write_timeout: 60s
+
+storage:
+  provider: s3
+  s3:
+    endpoint: "https://s3.amazonaws.com"
+    region: "us-east-1"
+    access_key: "${AWS_ACCESS_KEY_ID}"
+    secret_key: "${AWS_SECRET_ACCESS_KEY}"
+
+auth:
+  type: awsv4
+  identity: "${AWS_ACCESS_KEY_ID}"
+  credential: "${AWS_SECRET_ACCESS_KEY}"
+
+encryption:
+  enabled: true
+  algorithm: "AES-256-GCM"
+  key_provider: "local"  # Use "kms" for AWS KMS
+
+  # Local key provider configuration (for development/testing)
+  local:
+    # Base64-encoded 32-byte (256-bit) key
+    # Generate with: openssl rand -base64 32
+    master_key: "YOUR_BASE64_ENCODED_32_BYTE_KEY_HERE"
+
+  # AWS KMS configuration (for production)
+  # kms:
+  #   key_id: "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+  #   region: "us-east-1"
+  #   cache_ttl: 300  # 5 minutes
+
+  # Bucket-specific encryption policies
+  policies:
+    - bucket_pattern: "sensitive-*"
+      algorithm: "AES-256-GCM"
+      key_provider: "kms"
+      mandatory: true
+
+    - bucket_pattern: "archive-*"
+      algorithm: "AES-256-GCM"
+      key_provider: "local"
+      mandatory: false

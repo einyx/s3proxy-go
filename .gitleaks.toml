@@ -1,0 +1,54 @@
+# Gitleaks configuration for s3proxy-go
+title = "s3proxy-go gitleaks config"
+
+# Extend the base configuration
+[extend]
+useDefault = true
+
+# Additional rules for s3proxy specific patterns
+[[rules]]
+id = "s3-access-key"
+description = "AWS S3 Access Key"
+regex = '''(?i)(aws[_\-\s]?access[_\-\s]?key[_\-\s]?id|access[_\-\s]?key[_\-\s]?id|aws[_\-\s]?access[_\-\s]?key)[\s]*[=:]\s*["']?([A-Z0-9]{20})["']?'''
+tags = ["key", "AWS", "s3"]
+
+[[rules]]
+id = "s3-secret-key"
+description = "AWS S3 Secret Key"
+regex = '''(?i)(aws[_\-\s]?secret[_\-\s]?access[_\-\s]?key|secret[_\-\s]?access[_\-\s]?key|aws[_\-\s]?secret[_\-\s]?key|secret[_\-\s]?key)[\s]*[=:]\s*["']?([A-Za-z0-9/+=]{40})["']?'''
+tags = ["key", "AWS", "s3"]
+
+[[rules]]
+id = "azure-storage-key"
+description = "Azure Storage Account Key"
+regex = '''(?i)(DefaultEndpointsProtocol|AccountKey|azure[_\-\s]?storage[_\-\s]?key)[\s]*[=:]\s*["']?([a-zA-Z0-9+/]{86}==)["']?'''
+tags = ["key", "Azure"]
+
+[[rules]]
+id = "azure-connection-string"
+description = "Azure Storage Connection String"
+regex = '''(?i)(DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[a-zA-Z0-9+/]{86}==;EndpointSuffix=[^;]+)'''
+tags = ["key", "Azure"]
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API Key"
+regex = '''(?i)(api[_\-\s]?key|apikey|api[_\-\s]?secret)[\s]*[=:]\s*["']?([a-zA-Z0-9_\-]{32,})["']?'''
+tags = ["key", "generic"]
+
+# Allowlist for false positives
+[allowlist]
+description = "Global allowlist"
+paths = [
+    '''go\.sum$''',
+    '''.*\.lock$''',
+    '''vendor/''',
+    '''testdata/''',
+    '''.*_test\.go$''',
+]
+
+regexes = [
+    '''(?i)(example|test|fake|dummy|mock|sample)''',
+    '''(?i)\$\{[^}]+\}''',
+    '''(?i)secretKeyRef|valueFrom|configMapKeyRef''',
+]
