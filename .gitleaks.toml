@@ -10,12 +10,22 @@ paths = [
     '''.*\.min\.js''',
     '''.*\.min\.css''',
     '''.secrets.baseline''',
+    '''.*_test\.go''',
+    '''README\.md''',
+    '''wiki/.*''',
+    '''docs/.*\.md''',
+    '''examples/.*\.yaml''',
+    '''scripts/.*\.sh''',
+    '''docker-compose.*\.yml''',
+    '''README-.*\.md''',
 ]
 regexes = [
     '''example\.com''',
     '''test[_-]?key''',
     '''dummy[_-]?secret''',
     '''fake[_-]?token''',
+    '''AKIAIOSFODNN7EXAMPLE''',
+    '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
 ]
 commits = []
 

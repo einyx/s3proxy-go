@@ -219,6 +219,16 @@ func (s *S3Backend) removePrefixFromKey(virtualBucket, key string) string {
 	return strings.TrimPrefix(key, prefix)
 }
 
+// GetBucketConfig returns the configuration for a specific bucket
+func (s *S3Backend) GetBucketConfig(bucket string) *config.BucketConfig {
+	if s.bucketConfigs != nil {
+		if cfg, ok := s.bucketConfigs[bucket]; ok {
+			return cfg
+		}
+	}
+	return nil
+}
+
 func (s *S3Backend) getClientForBucket(bucket string) (*s3.S3, error) {
 	if s.bucketConfigs != nil {
 		if cfg, ok := s.bucketConfigs[bucket]; ok {
@@ -650,6 +660,14 @@ func (s *S3Backend) GetObject(ctx context.Context, bucket, key string) (*Object,
 		}
 	}
 
+	// Add KMS encryption metadata if present
+	if resp.ServerSideEncryption != nil && *resp.ServerSideEncryption == "aws:kms" {
+		metadata["x-amz-server-side-encryption"] = "aws:kms"
+		if resp.SSEKMSKeyId != nil {
+			metadata["x-amz-server-side-encryption-aws-kms-key-id"] = *resp.SSEKMSKeyId
+		}
+	}
+
 	body := newChunkedDecodingReader(resp.Body)
 
 	return &Object{
@@ -688,11 +706,27 @@ func (s *S3Backend) PutObject(ctx context.Context, bucket, key string, reader io
 		ContentLength: aws.Int64(size),
 	}
 
+	// Handle KMS encryption headers
+	kmsHeaders := make(map[string]string)
 	if len(metadata) > 0 {
-		input.Metadata = make(map[string]*string, len(metadata))
+		input.Metadata = make(map[string]*string)
 		for k, v := range metadata {
-			input.Metadata[k] = aws.String(v)
+			// Extract KMS headers from metadata
+			if strings.HasPrefix(k, "x-amz-server-side-encryption") {
+				kmsHeaders[k] = v
+			} else {
+				input.Metadata[k] = aws.String(v)
+			}
 		}
+	}
+
+	// Apply KMS encryption settings
+	if encryption, ok := kmsHeaders["x-amz-server-side-encryption"]; ok && encryption == "aws:kms" {
+		input.ServerSideEncryption = aws.String("aws:kms")
+		if keyId, ok := kmsHeaders["x-amz-server-side-encryption-aws-kms-key-id"]; ok {
+			input.SSEKMSKeyId = aws.String(keyId)
+		}
+		// Note: Encryption context would be handled via a different field if needed
 	}
 
 	client, err := s.getClientForBucket(bucket)
@@ -1007,10 +1041,25 @@ func (s *S3Backend) putObjectMultipart(ctx context.Context, virtualBucket, realB
 		Key:    aws.String(realKey),
 	}
 
+	// Handle KMS encryption headers
+	kmsHeaders := make(map[string]string)
 	if len(metadata) > 0 {
 		input.Metadata = make(map[string]*string)
 		for k, v := range metadata {
-			input.Metadata[k] = aws.String(v)
+			// Extract KMS headers from metadata
+			if strings.HasPrefix(k, "x-amz-server-side-encryption") {
+				kmsHeaders[k] = v
+			} else {
+				input.Metadata[k] = aws.String(v)
+			}
+		}
+	}
+
+	// Apply KMS encryption settings
+	if encryption, ok := kmsHeaders["x-amz-server-side-encryption"]; ok && encryption == "aws:kms" {
+		input.ServerSideEncryption = aws.String("aws:kms")
+		if keyId, ok := kmsHeaders["x-amz-server-side-encryption-aws-kms-key-id"]; ok {
+			input.SSEKMSKeyId = aws.String(keyId)
 		}
 	}
 

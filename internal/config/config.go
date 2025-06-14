@@ -69,12 +69,14 @@ type S3StorageConfig struct {
 
 // BucketConfig contains per-bucket configuration settings
 type BucketConfig struct {
-	RealName  string `mapstructure:"real_name"`  // Real bucket name in S3
-	Prefix    string `mapstructure:"prefix"`     // Optional prefix (subdirectory) within the bucket
-	Region    string `mapstructure:"region"`     // AWS region for this bucket
-	Endpoint  string `mapstructure:"endpoint"`   // Optional custom endpoint for this bucket
-	AccessKey string `mapstructure:"access_key"` // Optional per-bucket access key
-	SecretKey string `mapstructure:"secret_key"` // Optional per-bucket secret key
+	RealName             string            `mapstructure:"real_name"`              // Real bucket name in S3
+	Prefix               string            `mapstructure:"prefix"`                 // Optional prefix (subdirectory) within the bucket
+	Region               string            `mapstructure:"region"`                 // AWS region for this bucket
+	Endpoint             string            `mapstructure:"endpoint"`               // Optional custom endpoint for this bucket
+	AccessKey            string            `mapstructure:"access_key"`             // Optional per-bucket access key
+	SecretKey            string            `mapstructure:"secret_key"`             // Optional per-bucket secret key
+	KMSKeyID             string            `mapstructure:"kms_key_id"`             // Optional KMS key for this bucket
+	KMSEncryptionContext map[string]string `mapstructure:"kms_encryption_context"` // Optional encryption context
 }
 
 // FileSystemConfig contains filesystem storage backend settings
@@ -94,12 +96,15 @@ type AuthConfig struct {
 
 // EncryptionConfig specifies encryption settings
 type EncryptionConfig struct {
-	Enabled     bool               `mapstructure:"enabled" envconfig:"ENCRYPTION_ENABLED" default:"false"`
-	Algorithm   string             `mapstructure:"algorithm" envconfig:"ENCRYPTION_ALGORITHM" default:"AES-256-GCM"`
-	KeyProvider string             `mapstructure:"key_provider" envconfig:"ENCRYPTION_KEY_PROVIDER" default:"local"`
-	Local       *LocalKeyConfig    `mapstructure:"local"`
-	KMS         *KMSKeyConfig      `mapstructure:"kms"`
-	Policies    []EncryptionPolicy `mapstructure:"policies"`
+	Enabled      bool                      `mapstructure:"enabled" envconfig:"ENCRYPTION_ENABLED" default:"false"`
+	Algorithm    string                    `mapstructure:"algorithm" envconfig:"ENCRYPTION_ALGORITHM" default:"AES-256-GCM"`
+	KeyProvider  string                    `mapstructure:"key_provider" envconfig:"ENCRYPTION_KEY_PROVIDER" default:"local"`
+	Local        *LocalKeyConfig           `mapstructure:"local"`
+	KMS          *KMSKeyConfig             `mapstructure:"kms"`
+	AzureKV      *AzureKeyVaultConfig      `mapstructure:"azure_keyvault"`
+	Custom       *CustomKeyConfig          `mapstructure:"custom"`
+	KeyProviders map[string]ProviderConfig `mapstructure:"key_providers"` // Named providers for multi-provider support
+	Policies     []EncryptionPolicy        `mapstructure:"policies"`
 }
 
 // LocalKeyConfig contains settings for local key management
@@ -109,9 +114,38 @@ type LocalKeyConfig struct {
 
 // KMSKeyConfig contains settings for AWS KMS key management
 type KMSKeyConfig struct {
-	KeyID    string `mapstructure:"key_id" envconfig:"ENCRYPTION_KMS_KEY_ID"`
-	Region   string `mapstructure:"region" envconfig:"ENCRYPTION_KMS_REGION"`
-	CacheTTL int    `mapstructure:"cache_ttl" envconfig:"ENCRYPTION_KMS_CACHE_TTL" default:"300"`
+	Enabled           bool              `mapstructure:"enabled" envconfig:"KMS_ENABLED" default:"false"`
+	DefaultKeyID      string            `mapstructure:"default_key_id" envconfig:"KMS_DEFAULT_KEY_ID"`
+	KeySpec           string            `mapstructure:"key_spec" envconfig:"KMS_KEY_SPEC" default:"AES_256"`
+	Region            string            `mapstructure:"region" envconfig:"KMS_REGION"`
+	EncryptionContext map[string]string `mapstructure:"encryption_context"`
+	DataKeyCacheTTL   string            `mapstructure:"data_key_cache_ttl" envconfig:"KMS_DATA_KEY_CACHE_TTL" default:"5m"`
+	ValidateKeys      bool              `mapstructure:"validate_keys" envconfig:"KMS_VALIDATE_KEYS" default:"true"`
+	EnableKeyRotation bool              `mapstructure:"enable_key_rotation" envconfig:"KMS_ENABLE_KEY_ROTATION" default:"false"`
+}
+
+// AzureKeyVaultConfig contains settings for Azure Key Vault
+type AzureKeyVaultConfig struct {
+	VaultURL        string `mapstructure:"vault_url" envconfig:"AZURE_KV_VAULT_URL"`
+	ClientID        string `mapstructure:"client_id" envconfig:"AZURE_CLIENT_ID"`
+	ClientSecret    string `mapstructure:"client_secret" envconfig:"AZURE_CLIENT_SECRET"`
+	TenantID        string `mapstructure:"tenant_id" envconfig:"AZURE_TENANT_ID"`
+	KeySize         int    `mapstructure:"key_size" envconfig:"AZURE_KV_KEY_SIZE" default:"256"`
+	DataKeyCacheTTL string `mapstructure:"data_key_cache_ttl" envconfig:"AZURE_KV_DATA_KEY_CACHE_TTL" default:"5m"`
+}
+
+// CustomKeyConfig contains settings for custom key provider
+type CustomKeyConfig struct {
+	MasterKey         string `mapstructure:"master_key" envconfig:"CUSTOM_MASTER_KEY"`
+	MasterKeyFile     string `mapstructure:"master_key_file" envconfig:"CUSTOM_MASTER_KEY_FILE"`
+	KeyDerivationSalt string `mapstructure:"key_derivation_salt" envconfig:"CUSTOM_KEY_DERIVATION_SALT"`
+	DataKeyCacheTTL   string `mapstructure:"data_key_cache_ttl" envconfig:"CUSTOM_DATA_KEY_CACHE_TTL" default:"5m"`
+}
+
+// ProviderConfig represents a generic provider configuration
+type ProviderConfig struct {
+	Type   string                 `mapstructure:"type"` // aws-kms, azure-keyvault, custom, local
+	Config map[string]interface{} `mapstructure:"config"`
 }
 
 // EncryptionPolicy defines bucket-specific encryption policies
