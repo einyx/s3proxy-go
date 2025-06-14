@@ -91,7 +91,10 @@ func New(ctx context.Context, cfg *Config) (*Manager, error) {
 
 // IsEnabled returns whether KMS encryption is enabled
 func (m *Manager) IsEnabled() bool {
-	return m.config != nil && m.config.Enabled && m.client != nil
+	if m == nil || m.config == nil {
+		return false
+	}
+	return m.config.Enabled && m.client != nil
 }
 
 // GetEncryptionHeaders returns S3 encryption headers for KMS
@@ -100,13 +103,14 @@ func (m *Manager) GetEncryptionHeaders(bucket string, bucketConfig *BucketKMSCon
 		return nil
 	}
 
-	headers := make(map[string]string)
+	headers := make(map[string]string, 3) // Pre-allocate for common case
 	headers["x-amz-server-side-encryption"] = "aws:kms"
 
 	// Determine which key to use
 	keyID := m.config.DefaultKeyID
 	encContext := m.config.EncryptionContext
 
+	// Override with bucket-specific config if provided
 	if bucketConfig != nil && bucketConfig.KeyID != "" {
 		keyID = bucketConfig.KeyID
 		if bucketConfig.OverrideDefault || len(bucketConfig.EncryptionContext) > 0 {
@@ -135,6 +139,10 @@ func (m *Manager) ValidateKey(ctx context.Context, keyID string) (*KeyInfo, erro
 		return nil, fmt.Errorf("kms is not enabled")
 	}
 
+	if keyID == "" {
+		return nil, fmt.Errorf("keyID cannot be empty")
+	}
+
 	// Check cache first
 	m.keyCacheMu.RLock()
 	if info, ok := m.keyCache[keyID]; ok {
@@ -155,11 +163,21 @@ func (m *Manager) ValidateKey(ctx context.Context, keyID string) (*KeyInfo, erro
 	}
 
 	keyMeta := describeResp.KeyMetadata
+	if keyMeta == nil {
+		return nil, fmt.Errorf("key metadata is nil for key %s", keyID)
+	}
+
 	info := &KeyInfo{
-		KeyID:         *keyMeta.KeyId,
-		Arn:           *keyMeta.Arn,
 		Enabled:       keyMeta.KeyState == types.KeyStateEnabled,
 		LastValidated: time.Now(),
+	}
+
+	// Safely assign string pointers
+	if keyMeta.KeyId != nil {
+		info.KeyID = *keyMeta.KeyId
+	}
+	if keyMeta.Arn != nil {
+		info.Arn = *keyMeta.Arn
 	}
 
 	if keyMeta.Description != nil {
@@ -207,6 +225,10 @@ func (m *Manager) GenerateDataKey(ctx context.Context, keyID string, context map
 		return nil, fmt.Errorf("kms is not enabled")
 	}
 
+	if keyID == "" {
+		return nil, fmt.Errorf("keyID cannot be empty")
+	}
+
 	// Check cache first
 	cacheKey := buildDataKeyCacheKey(keyID, context)
 	if dataKey := m.dataKeyCache.Get(cacheKey); dataKey != nil {
@@ -225,6 +247,11 @@ func (m *Manager) GenerateDataKey(ctx context.Context, keyID string, context map
 	resp, err := m.client.GenerateDataKey(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate data key: %w", err)
+	}
+
+	// Validate response
+	if resp == nil || len(resp.Plaintext) == 0 || len(resp.CiphertextBlob) == 0 {
+		return nil, fmt.Errorf("invalid response from KMS: missing data key")
 	}
 
 	dataKey := &DataKey{
@@ -247,6 +274,10 @@ func (m *Manager) DecryptDataKey(ctx context.Context, ciphertextBlob []byte, con
 		return nil, fmt.Errorf("kms is not enabled")
 	}
 
+	if len(ciphertextBlob) == 0 {
+		return nil, fmt.Errorf("ciphertextBlob cannot be empty")
+	}
+
 	input := &kms.DecryptInput{
 		CiphertextBlob: ciphertextBlob,
 	}
@@ -260,19 +291,34 @@ func (m *Manager) DecryptDataKey(ctx context.Context, ciphertextBlob []byte, con
 		return nil, fmt.Errorf("failed to decrypt data key: %w", err)
 	}
 
-	return &DataKey{
-		KeyID:             *resp.KeyId,
+	// Validate response
+	if resp == nil || len(resp.Plaintext) == 0 {
+		return nil, fmt.Errorf("invalid response from KMS: missing plaintext")
+	}
+
+	dataKey := &DataKey{
 		PlaintextKey:      resp.Plaintext,
 		CiphertextBlob:    ciphertextBlob,
 		EncryptionContext: context,
 		CreatedAt:         time.Now(),
-	}, nil
+	}
+
+	// Safely assign KeyID if present
+	if resp.KeyId != nil {
+		dataKey.KeyID = *resp.KeyId
+	}
+
+	return dataKey, nil
 }
 
 // GetKeyRotationStatus checks if key rotation is enabled
 func (m *Manager) GetKeyRotationStatus(ctx context.Context, keyID string) (bool, error) {
 	if !m.IsEnabled() {
 		return false, fmt.Errorf("kms is not enabled")
+	}
+
+	if keyID == "" {
+		return false, fmt.Errorf("keyID cannot be empty")
 	}
 
 	resp, err := m.client.GetKeyRotationStatus(ctx, &kms.GetKeyRotationStatusInput{
@@ -291,6 +337,10 @@ func (m *Manager) EnableKeyRotation(ctx context.Context, keyID string) error {
 		return fmt.Errorf("kms is not enabled")
 	}
 
+	if keyID == "" {
+		return fmt.Errorf("keyID cannot be empty")
+	}
+
 	_, err := m.client.EnableKeyRotation(ctx, &kms.EnableKeyRotationInput{
 		KeyId: aws.String(keyID),
 	})
@@ -303,7 +353,16 @@ func (m *Manager) EnableKeyRotation(ctx context.Context, keyID string) error {
 
 // Close cleans up resources
 func (m *Manager) Close() {
+	if m == nil {
+		return
+	}
+
 	if m.dataKeyCache != nil {
 		m.dataKeyCache.Close()
 	}
+
+	// Clear key cache to free memory
+	m.keyCacheMu.Lock()
+	m.keyCache = nil
+	m.keyCacheMu.Unlock()
 }

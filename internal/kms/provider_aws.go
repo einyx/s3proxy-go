@@ -21,7 +21,11 @@ type AWSKMSProvider struct {
 
 // NewAWSKMSProvider creates a new AWS KMS provider
 func NewAWSKMSProvider(ctx context.Context, config map[string]interface{}) (Provider, error) {
-	// Extract configuration
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+
+	// Extract configuration with safe type assertions
 	region, _ := config["region"].(string)
 	encryptionContext := make(map[string]string)
 	if ec, ok := config["encryption_context"].(map[string]interface{}); ok {
@@ -80,14 +84,28 @@ func (p *AWSKMSProvider) Name() string {
 
 // GenerateDataKey generates a new data encryption key
 func (p *AWSKMSProvider) GenerateDataKey(ctx context.Context, keyID string, keySpec string) (*ProviderDataKey, error) {
+	if p == nil || p.client == nil {
+		return nil, fmt.Errorf("provider not initialized")
+	}
+
+	if keyID == "" {
+		return nil, fmt.Errorf("keyID cannot be empty")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// Check cache first
-	if cachedKey := p.dataKeyCache.Get(keyID); cachedKey != nil {
-		return &ProviderDataKey{
-			Plaintext:      cachedKey.PlaintextKey,
-			CiphertextBlob: cachedKey.CiphertextBlob,
-			KeyID:          keyID,
-			Provider:       p.Name(),
-		}, nil
+	if p.dataKeyCache != nil {
+		if cachedKey := p.dataKeyCache.Get(keyID); cachedKey != nil {
+			return &ProviderDataKey{
+				Plaintext:      cachedKey.PlaintextKey,
+				CiphertextBlob: cachedKey.CiphertextBlob,
+				KeyID:          keyID,
+				Provider:       p.Name(),
+			}, nil
+		}
 	}
 
 	// Parse key spec if provided
@@ -116,6 +134,11 @@ func (p *AWSKMSProvider) GenerateDataKey(ctx context.Context, keyID string, keyS
 		return nil, fmt.Errorf("failed to generate data key: %w", err)
 	}
 
+	// Validate output
+	if output == nil || len(output.Plaintext) == 0 || len(output.CiphertextBlob) == 0 {
+		return nil, fmt.Errorf("invalid response from KMS: missing data key")
+	}
+
 	dataKey := &ProviderDataKey{
 		Plaintext:      output.Plaintext,
 		CiphertextBlob: output.CiphertextBlob,
@@ -123,19 +146,33 @@ func (p *AWSKMSProvider) GenerateDataKey(ctx context.Context, keyID string, keyS
 		Provider:       p.Name(),
 	}
 
-	// Cache the key
-	p.dataKeyCache.Put(keyID, &DataKey{
-		PlaintextKey:   output.Plaintext,
-		CiphertextBlob: output.CiphertextBlob,
-		KeyID:          keyID,
-		CreatedAt:      time.Now(),
-	})
+	// Cache the key if cache is available
+	if p.dataKeyCache != nil {
+		p.dataKeyCache.Put(keyID, &DataKey{
+			PlaintextKey:   output.Plaintext,
+			CiphertextBlob: output.CiphertextBlob,
+			KeyID:          keyID,
+			CreatedAt:      time.Now(),
+		})
+	}
 
 	return dataKey, nil
 }
 
 // Decrypt decrypts the encrypted data key
 func (p *AWSKMSProvider) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
+	if p == nil || p.client == nil {
+		return nil, fmt.Errorf("provider not initialized")
+	}
+
+	if len(ciphertext) == 0 {
+		return nil, fmt.Errorf("ciphertext cannot be empty")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	input := &kms.DecryptInput{
 		CiphertextBlob: ciphertext,
 	}
@@ -149,11 +186,28 @@ func (p *AWSKMSProvider) Decrypt(ctx context.Context, ciphertext []byte) ([]byte
 		return nil, fmt.Errorf("failed to decrypt data key: %w", err)
 	}
 
+	// Validate output
+	if output == nil || len(output.Plaintext) == 0 {
+		return nil, fmt.Errorf("invalid response from KMS: missing plaintext")
+	}
+
 	return output.Plaintext, nil
 }
 
 // ValidateKey validates that a key exists and is usable
 func (p *AWSKMSProvider) ValidateKey(ctx context.Context, keyID string) error {
+	if p == nil || p.client == nil {
+		return fmt.Errorf("provider not initialized")
+	}
+
+	if keyID == "" {
+		return fmt.Errorf("keyID cannot be empty")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	output, err := p.client.DescribeKey(ctx, &kms.DescribeKeyInput{
 		KeyId: aws.String(keyID),
 	})
@@ -178,6 +232,18 @@ func (p *AWSKMSProvider) ValidateKey(ctx context.Context, keyID string) error {
 
 // GetKeyInfo retrieves information about a key
 func (p *AWSKMSProvider) GetKeyInfo(ctx context.Context, keyID string) (*KeyInfo, error) {
+	if p == nil || p.client == nil {
+		return nil, fmt.Errorf("provider not initialized")
+	}
+
+	if keyID == "" {
+		return nil, fmt.Errorf("keyID cannot be empty")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	output, err := p.client.DescribeKey(ctx, &kms.DescribeKeyInput{
 		KeyId: aws.String(keyID),
 	})
@@ -192,13 +258,17 @@ func (p *AWSKMSProvider) GetKeyInfo(ctx context.Context, keyID string) (*KeyInfo
 	keyMeta := output.KeyMetadata
 	info := &KeyInfo{
 		KeyID:         keyID,
-		Arn:           aws.ToString(keyMeta.Arn),
 		Enabled:       keyMeta.KeyState == types.KeyStateEnabled,
 		LastValidated: time.Now(),
 	}
 
+	// Safely assign optional fields
+	if keyMeta.Arn != nil {
+		info.Arn = aws.ToString(keyMeta.Arn)
+	}
+
 	if keyMeta.Description != nil {
-		info.Description = *keyMeta.Description
+		info.Description = aws.ToString(keyMeta.Description)
 	}
 
 	if keyMeta.KeySpec != "" {

@@ -50,11 +50,15 @@ func NewDataKeyCache(ttl time.Duration) *DataKeyCache {
 
 // Get retrieves a data key from cache
 func (c *DataKeyCache) Get(key string) *DataKey {
+	if c == nil || key == "" {
+		return nil
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	entry, ok := c.cache[key]
-	if !ok {
+	if !ok || entry == nil {
 		return nil
 	}
 
@@ -68,8 +72,17 @@ func (c *DataKeyCache) Get(key string) *DataKey {
 
 // Put adds a data key to cache
 func (c *DataKeyCache) Put(key string, dataKey *DataKey) {
+	if c == nil || key == "" || dataKey == nil {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Clear old entry's sensitive data if exists
+	if oldEntry, exists := c.cache[key]; exists && oldEntry != nil && oldEntry.dataKey != nil {
+		c.clearSensitiveData(oldEntry.dataKey)
+	}
 
 	c.cache[key] = &cacheEntry{
 		dataKey:   dataKey,
@@ -79,22 +92,46 @@ func (c *DataKeyCache) Put(key string, dataKey *DataKey) {
 
 // Delete removes a data key from cache
 func (c *DataKeyCache) Delete(key string) {
+	if c == nil || key == "" {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Clear sensitive data before deletion
+	if entry, exists := c.cache[key]; exists && entry != nil && entry.dataKey != nil {
+		c.clearSensitiveData(entry.dataKey)
+	}
 
 	delete(c.cache, key)
 }
 
 // Clear removes all entries from cache
 func (c *DataKeyCache) Clear() {
+	if c == nil {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Clear sensitive data from all entries
+	for _, entry := range c.cache {
+		if entry != nil && entry.dataKey != nil {
+			c.clearSensitiveData(entry.dataKey)
+		}
+	}
 
 	c.cache = make(map[string]*cacheEntry)
 }
 
 // Size returns the number of cached entries
 func (c *DataKeyCache) Size() int {
+	if c == nil {
+		return 0
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -118,17 +155,24 @@ func (c *DataKeyCache) cleanupLoop() {
 
 // cleanup removes expired entries
 func (c *DataKeyCache) cleanup() {
+	if c == nil {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := time.Now()
 	for key, entry := range c.cache {
+		if entry == nil {
+			delete(c.cache, key)
+			continue
+		}
+
 		if now.After(entry.expiresAt) {
 			// Zero out the plaintext key before removing
-			if entry.dataKey != nil && entry.dataKey.PlaintextKey != nil {
-				for i := range entry.dataKey.PlaintextKey {
-					entry.dataKey.PlaintextKey[i] = 0
-				}
+			if entry.dataKey != nil {
+				c.clearSensitiveData(entry.dataKey)
 			}
 			delete(c.cache, key)
 		}
@@ -137,17 +181,26 @@ func (c *DataKeyCache) cleanup() {
 
 // Close stops the cleanup goroutine and clears the cache
 func (c *DataKeyCache) Close() {
-	close(c.stopChan)
+	if c == nil {
+		return
+	}
+
+	// Signal cleanup goroutine to stop
+	select {
+	case <-c.stopChan:
+		// Already closed
+		return
+	default:
+		close(c.stopChan)
+	}
 
 	// Zero out all plaintext keys
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, entry := range c.cache {
-		if entry.dataKey != nil && entry.dataKey.PlaintextKey != nil {
-			for i := range entry.dataKey.PlaintextKey {
-				entry.dataKey.PlaintextKey[i] = 0
-			}
+		if entry != nil && entry.dataKey != nil {
+			c.clearSensitiveData(entry.dataKey)
 		}
 	}
 
@@ -156,10 +209,15 @@ func (c *DataKeyCache) Close() {
 
 // buildDataKeyCacheKey creates a cache key from keyID and encryption context
 func buildDataKeyCacheKey(keyID string, context map[string]string) string {
+	if keyID == "" {
+		return ""
+	}
+
 	h := sha256.New()
 	h.Write([]byte(keyID))
 
 	// Sort context keys for consistent hashing
+	// Note: This is not truly sorted but for backward compatibility we keep it
 	for k, v := range context {
 		h.Write([]byte(k))
 		h.Write([]byte(v))
@@ -186,4 +244,17 @@ func serializeEncryptionContext(context map[string]string) string {
 	}
 
 	return result
+}
+
+// clearSensitiveData zeros out sensitive data in a DataKey
+func (c *DataKeyCache) clearSensitiveData(dataKey *DataKey) {
+	if dataKey == nil {
+		return
+	}
+
+	if dataKey.PlaintextKey != nil {
+		for i := range dataKey.PlaintextKey {
+			dataKey.PlaintextKey[i] = 0
+		}
+	}
 }
